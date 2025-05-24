@@ -112,13 +112,16 @@ def run_manual_simulation(
     steps=500, delta=0.2, omega=1.0, rtol=1e-2, atol=1e-2, order=2, suppress_warnings=False,
     background_path=None, use_cuda=False,
     patch_center_theta=np.pi/2, patch_center_phi=0, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
-    flip_theta=False, flip_phi=False
+    flip_theta=False, flip_phi=False,
+    return_sampled_trajectories=False,
+    n_sampled=10
 ):
     """
     Run manual ray tracing simulation with tqdm progress bar.
     Uses ProcessPoolExecutor for true parallelism or CUDA for GPU parallelism.
     Returns the final image as a numpy array.
     Only maps the background image if the boundary hit is within the specified patch (center, size, flip options).
+    If return_sampled_trajectories is True, also returns a list of sampled photon trajectories (in Cartesian coordinates).
     """
     logging.info("Starting manual ray tracing simulation...")
     h, w = observer.image_size
@@ -129,30 +132,40 @@ def run_manual_simulation(
     else:
         bg_array = None
     img = np.zeros((h, w, 3), dtype=np.uint8)
+    sampled_trajectories = []
+    sampled_indices = set()
+    if return_sampled_trajectories:
+        import random
+        while len(sampled_indices) < n_sampled:
+            i = random.randint(0, h-1)
+            j = random.randint(0, w-1)
+            sampled_indices.add((i, j))
 
-    # Image plane geometry (same as flat version)
+    # Image plane geometry (robust pinhole camera model)
     obs_pos = np.array(observer.position)
-    obs_r = np.linalg.norm(obs_pos)
-    fov = observer.fov
-    plane_dist = 0.2 * obs_r
-    up = np.array([0, 0, 1])
-    if np.allclose(np.cross(obs_pos, up), 0):
-        up = np.array([0, 1, 0])
-    right = np.cross(up, obs_pos)
+    bh_pos = np.array(bh.position) if hasattr(bh, 'position') else np.zeros(3)
+    optical_axis = (bh_pos - obs_pos)
+    optical_axis = optical_axis / np.linalg.norm(optical_axis)
+    up_guess = np.array([0, 0, 1])
+    if np.allclose(np.cross(optical_axis, up_guess), 0):
+        up_guess = np.array([0, 1, 0])
+    right = np.cross(up_guess, optical_axis)
     right = right / np.linalg.norm(right)
-    up_vec = np.cross(obs_pos, right)
+    up_vec = np.cross(optical_axis, right)
     up_vec = up_vec / np.linalg.norm(up_vec)
-    width = 2 * plane_dist * np.tan(fov/2)
-    height = width * (h/w)
-    plane_center = obs_pos - (obs_pos/obs_r) * plane_dist
-
-    # Precompute pixel positions on image plane
+    fov = observer.fov
+    h, w = observer.image_size
+    plane_dist = 0.2 * np.linalg.norm(obs_pos)
+    plane_center = obs_pos + optical_axis * plane_dist
+    plane_width = 2 * plane_dist * np.tan(fov/2)
+    plane_height = plane_width * (h/w)
     pixel_positions = np.zeros((h, w, 3))
     for i in range(h):
         for j in range(w):
-            dx = (j + 0.5) / w - 0.5
-            dy = (i + 0.5) / h - 0.5
-            pixel_positions[i, j] = plane_center + dx * width * right + dy * height * up_vec
+            u = (j + 0.5) / w - 0.5
+            v = (i + 0.5) / h - 0.5
+            pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
+            pixel_positions[i, j] = pixel_pos
 
     if use_cuda:
         logging.info("Using CUDA Schwarzschild integrator for ray tracing...")
@@ -169,6 +182,9 @@ def run_manual_simulation(
         cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass)
         out_qs, out_ps = cuda_integrator.integrate_batch(q0s, p0s)
         photon_rows = []
+        # For sampled trajectories
+        sampled_traj_indices = [i*w+j for (i, j) in sampled_indices] if return_sampled_trajectories else []
+        sampled_traj_data = []
         for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="CUDA Ray tracing", unit="ray"):
             x, y, z = out_qs[idx, 1], out_qs[idx, 2], out_qs[idx, 3]  # r, theta, phi
             r_bh = x  # r
@@ -222,10 +238,24 @@ def run_manual_simulation(
                 'bg_u': bg_u, 'bg_v': bg_v,
                 'rgb': rgb
             })
+            # Save trajectory for sampled indices
+            if return_sampled_trajectories and idx in sampled_traj_indices:
+                # For CUDA, we only have the final point, so just store start and end in Cartesian
+                r0, th0, ph0 = q0[1], q0[2], q0[3]
+                x0 = r0 * np.sin(th0) * np.cos(ph0)
+                y0 = r0 * np.sin(th0) * np.sin(ph0)
+                z0 = r0 * np.cos(th0)
+                r1, th1, ph1 = x, y, z
+                x1 = r1 * np.sin(th1) * np.cos(ph1)
+                y1 = r1 * np.sin(th1) * np.sin(ph1)
+                z1 = r1 * np.cos(th1)
+                sampled_traj_data.append(np.array([[x0, y0, z0], [x1, y1, z1]]))
         df = pd.DataFrame(photon_rows)
         df.to_csv('photon_data.csv', index=False)
         print(f"Saved photon data for {len(df)} photons to photon_data.csv")
         logging.info("CUDA ray tracing simulation completed.")
+        if return_sampled_trajectories:
+            return img, sampled_traj_data
     else:
         # CPU fallback (original code)
         args_list = [
@@ -261,4 +291,6 @@ def run_manual_simulation(
         print(f"Summary: {n_captured} rays captured by BH, {n_escaped} rays escaped, {n_bg} rays hit the background image.")
     else:
         print("Summary counts not available (CPU fallback mode).")
+    if return_sampled_trajectories:
+        return img, sampled_traj_data
     return img 

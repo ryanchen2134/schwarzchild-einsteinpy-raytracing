@@ -34,19 +34,21 @@ def save_no_gravity_image_with_background(
     out_img = np.zeros((h, w, 3), dtype=np.uint8)
 
     obs_pos = np.array(observer.position)
-    obs_r = np.linalg.norm(obs_pos)
-    fov = observer.fov
-    plane_dist = 0.2 * obs_r
-    up = np.array([0, 0, 1])
-    if np.allclose(np.cross(obs_pos, up), 0):
-        up = np.array([0, 1, 0])
-    right = np.cross(up, obs_pos)
+    bh_pos = np.zeros(3)  # Assume BH at origin for flat case
+    optical_axis = (bh_pos - obs_pos)
+    optical_axis = optical_axis / np.linalg.norm(optical_axis)
+    up_guess = np.array([0, 0, 1])
+    if np.allclose(np.cross(optical_axis, up_guess), 0):
+        up_guess = np.array([0, 1, 0])
+    right = np.cross(up_guess, optical_axis)
     right = right / np.linalg.norm(right)
-    up_vec = np.cross(obs_pos, right)
+    up_vec = np.cross(optical_axis, right)
     up_vec = up_vec / np.linalg.norm(up_vec)
-    width = 2 * plane_dist * np.tan(fov/2)
-    height = width * (h/w)
-    plane_center = obs_pos - (obs_pos/obs_r) * plane_dist
+    fov = observer.fov
+    plane_dist = 0.2 * np.linalg.norm(obs_pos)
+    plane_center = obs_pos + optical_axis * plane_dist
+    plane_width = 2 * plane_dist * np.tan(fov/2)
+    plane_height = plane_width * (h/w)
 
     if not override_patch_center or patch_center_theta is None or patch_center_phi is None:
         opp_pos = -obs_pos
@@ -95,9 +97,9 @@ def save_no_gravity_image_with_background(
     else:
         for i in tqdm(range(h), desc='Flat ray tracing', unit='row'):
             for j in range(w):
-                dx = (j + 0.5) / w - 0.5
-                dy = (i + 0.5) / h - 0.5
-                pixel_pos = plane_center + dx * width * right + dy * height * up_vec
+                u = (j + 0.5) / w - 0.5
+                v = (i + 0.5) / h - 0.5
+                pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
                 ray_dir = pixel_pos - obs_pos
                 ray_dir = ray_dir / np.linalg.norm(ray_dir)
                 a = np.dot(ray_dir, ray_dir)
@@ -119,12 +121,12 @@ def save_no_gravity_image_with_background(
                 if in_patch:
                     theta_map = (np.pi - theta) if flip_theta else theta
                     phi_map = (-phi) if flip_phi else phi
-                    u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
+                    u_bg = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
                     phi_mod = (phi_map - phi0) % (2 * np.pi)
-                    v = int(phi_mod / phi_span * (w - 1))
-                    u = min(max(u, 0), h - 1)
-                    v = min(max(v, 0), w - 1)
-                    out_img[i, j] = bg_array[u, v]
+                    v_bg = int(phi_mod / phi_span * (w - 1))
+                    u_bg = min(max(u_bg, 0), h - 1)
+                    v_bg = min(max(v_bg, 0), w - 1)
+                    out_img[i, j] = bg_array[u_bg, v_bg]
                 else:
                     out_img[i, j] = (0, 0, 0)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

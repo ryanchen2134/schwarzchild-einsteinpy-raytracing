@@ -2,7 +2,6 @@ import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Black Hole Ray Tracing Simulation")
-    parser.add_argument('--mode', choices=['shadow', 'manual'], default='shadow', help='Simulation mode: shadow (fast, built-in) or manual (custom)')
     parser.add_argument('--size', type=int, default=32, help='Image size (NxN)')
     parser.add_argument('--fov', type=float, default=30.0, help='Field of view in degrees')
     parser.add_argument('--background', type=str, default='images/backgrounds/milky-way-background.jpeg', help='Background image path')
@@ -25,4 +24,5 @@ def parse_args():
     parser.add_argument('--bg-patch-size-phi', type=float, default=10, help='Background patch size phi (deg, default: 10)')
     parser.add_argument('--bg-flip-theta', action='store_true', help='Flip theta mapping for background patch')
     parser.add_argument('--bg-flip-phi', action='store_true', help='Flip phi mapping for background patch')
+    parser.add_argument('--no-flat-trajectories', action='store_true', help='Disable calculation and plotting of flat (no-gravity) trajectories in the 3D scene')
     return parser.parse_args() 

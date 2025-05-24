@@ -116,7 +116,7 @@ def cartesian_to_spherical_momentum(ray_dir, obs_pos):
 def plot_scene_embedding_3d(
     bh, observer, image_plane_size, boundary_radius, out_path='images/scene_topdown.png', fov_deg=None, photon_trajectories=None,
     patch_center_theta=None, patch_center_phi=None, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
-    override_patch_center=False
+    override_patch_center=False, flat_trajectories=None
 ):
     """
     Plot a 3D view of the Schwarzschild spatial hypersurface embedding with simulation elements to scale:
@@ -125,7 +125,7 @@ def plot_scene_embedding_3d(
     - Image plane (rectangle)
     - Simulation boundary (sphere)
     - User-supplied photon trajectories (list of arrays of shape (N,3)), plotted in orange
-    - Optionally: flat_trajectories (list of arrays of shape (N,3)), plotted in cyan
+    - Optionally: flat_trajectories (list of arrays of shape (N,3)), plotted in blue
     - Background patch as a magenta patch/arc/segment on the boundary sphere
     - By default, the patch center is set to the point on the boundary directly opposite the observer (unless override_patch_center=True).
     """
@@ -172,12 +172,13 @@ def plot_scene_embedding_3d(
             zs.append(corner[2])
     ax.plot(xs, ys, zs, color='blue', lw=2, label='Image Plane')
 
+    
     # 5. Add simulation boundary (sphere)
     br = boundary_radius
     x_b = br * np.cos(u_sphere) * np.sin(v_sphere)
     y_b = br * np.sin(u_sphere) * np.sin(v_sphere)
     z_b = br * np.cos(v_sphere)
-    ax.plot_wireframe(x_b, y_b, z_b, color='gray', alpha=0.1, label='Boundary')
+    ax.plot_wireframe(x_b, y_b, z_b, color='gray', alpha=0.05, label='Boundary')
 
     # 5b. Draw background patch as magenta points/mesh on the boundary sphere (higher fidelity)
     if not override_patch_center or patch_center_theta is None or patch_center_phi is None:
@@ -204,6 +205,11 @@ def plot_scene_embedding_3d(
         for traj in photon_trajectories:
             ax.plot(traj[:,0], traj[:,1], traj[:,2], color='orange', lw=2, alpha=0.9, label='Sampled Ray' if 'Sampled Ray' not in ax.get_legend_handles_labels()[1] else None)
 
+    # 6b. Plot straight-line (no-gravity) photon trajectories (blue)
+    if flat_trajectories is not None:
+        for traj in flat_trajectories:
+            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='blue', lw=2, alpha=0.7, label='Straight Ray' if 'Straight Ray' not in ax.get_legend_handles_labels()[1] else None)
+
     # 7. Plot event horizon last for visibility: solid + wireframe
     ax.plot_surface(x_s, y_s, z_s, color='black', alpha=1.0, zorder=20)
     ax.plot_wireframe(x_s, y_s, z_s, color='yellow', linewidth=0.7, zorder=21)
@@ -224,6 +230,7 @@ def plot_scene_embedding_3d(
         Line2D([0], [0], color='blue', lw=2, label='Image Plane'),
         Line2D([0], [0], color='green', lw=2, label='Boundary'),
         Line2D([0], [0], color='orange', lw=2, label='Sampled Rays'),
+        Line2D([0], [0], color='blue', lw=2, label='Straight Rays'),
     ]
     legend_elements.append(Line2D([0], [0], color='magenta', lw=2, label='Background Patch'))
     ax.legend(handles=legend_elements)
@@ -232,7 +239,7 @@ def plot_scene_embedding_3d(
 
     # --- Output 3 perspectives rotated about z axis ---
     base, ext = os.path.splitext(out_path)
-    for i, azim in enumerate([0, 120, 240]):
+    for i, azim in enumerate([0,90,120, 180 ,240]):
         ax.view_init(elev=30, azim=azim)  # 30 deg elevation, azim rotation
         out_path_rot = f"{base}_azim{azim}{ext}"
         fig.savefig(out_path_rot)
