@@ -1,0 +1,5 @@
+photon_data.csv filter=lfs diff=lfs merge=lfs -text
+sampled_rays.csv filter=lfs diff=lfs merge=lfs -text
+sampled_rays_theta_band.csv filter=lfs diff=lfs merge=lfs -text
+single_ray_cuda_test.csv filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
