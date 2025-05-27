@@ -6,7 +6,7 @@ from einsteinpy.plotting import HypersurfacePlotter
 from astropy import units as u
 from mpl_toolkits.mplot3d import Axes3D
 import random
-from simulation.cuda_geodesic import CUDASchwarzschildIntegrator, observer_angles_to_global_momentum, compute_null_4momentum_schwarzschild
+from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
 from simulation.utils import get_initial_conditions
 
 def plot_placeholder():
@@ -201,9 +201,22 @@ def plot_scene_embedding_3d(
     ax.plot_surface(patch_x, patch_y, patch_z, color='magenta', alpha=0.5, linewidth=0, antialiased=True, zorder=10)
 
     # 6. Plot user-supplied photon trajectories (orange)
-    if photon_trajectories is not None:
+    if photon_trajectories is not None and len(photon_trajectories) > 0:
         for traj in photon_trajectories:
-            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='orange', lw=2, alpha=0.9, label='Sampled Ray' if 'Sampled Ray' not in ax.get_legend_handles_labels()[1] else None)
+            if traj.shape[0] < 4:
+                # Densify if only endpoints are provided
+                p0, p1 = traj[0], traj[-1]
+                n_interp = 50
+                alphas = np.linspace(0, 1, n_interp)
+                traj_dense = np.outer(1 - alphas, p0) + np.outer(alphas, p1)
+            else:
+                traj_dense = traj
+            ax.plot(traj_dense[:, 0], traj_dense[:, 1], traj_dense[:, 2], color='orange', lw=3, alpha=1.0, zorder=15, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
+            # Mark start & end points for clarity
+            ax.scatter(traj_dense[0,0], traj_dense[0,1], traj_dense[0,2], color='lime', s=30, zorder=16)
+            ax.scatter(traj_dense[-1,0], traj_dense[-1,1], traj_dense[-1,2], color='red', s=30, zorder=16)
+    else:
+        print("[plot_scene_embedding_3d] Warning: photon_trajectories is None or empty. No sampled rays to plot.")
 
     # 6b. Plot straight-line (no-gravity) photon trajectories (blue)
     if flat_trajectories is not None:

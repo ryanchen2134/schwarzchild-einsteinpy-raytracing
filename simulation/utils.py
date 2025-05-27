@@ -1,4 +1,5 @@
 import numpy as np
+from einsteinpy.coordinates.utils import cartesian_to_spherical_fast
 from simulation.cuda_geodesic import compute_null_4momentum_schwarzschild
 
 def get_initial_conditions(observer_pos, pixel_pos):
@@ -13,13 +14,8 @@ def get_initial_conditions(observer_pos, pixel_pos):
     r = np.linalg.norm([x, y, z])
     theta = np.arccos(z / r)
     phi = np.arctan2(y, x)
-    # Spherical basis at observer
-    e_r = np.array([np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), np.cos(theta)])
-    e_theta = np.array([np.cos(theta)*np.cos(phi), np.cos(theta)*np.sin(phi), -np.sin(theta)])
-    e_phi = np.array([-np.sin(phi), np.cos(phi), 0])
-    pr = np.dot(ray_dir, e_r)
-    ptheta = np.dot(ray_dir, e_theta)
-    pphi = np.dot(ray_dir, e_phi)
+    # Use EinsteinPy's fast cartesian to spherical conversion for the direction
+    _, _, _, _, pr, ptheta, pphi = cartesian_to_spherical_fast(0.0, x, y, z, ray_dir[0], ray_dir[1], ray_dir[2], velocities_provided=True)
     q0 = np.array([0.0, r, theta, phi])
-    p0 = np.array(compute_null_4momentum_schwarzschild(q0, [pr, ptheta, pphi]))
+    p0 = np.array([0.0, pr, ptheta, pphi])
     return q0, p0 

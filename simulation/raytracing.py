@@ -6,22 +6,10 @@ import logging
 from tqdm import tqdm
 from .blackhole import BlackHole, Observer
 from PIL import Image
-from simulation.cuda_geodesic import CUDASchwarzschildIntegrator, compute_null_4momentum_schwarzschild
 import pandas as pd
 from simulation.utils import get_initial_conditions
+import warnings  # CUDA curved geodesic path removed
 
-def cartesian_to_spherical_momentum(ray_dir, obs_pos):
-    x, y, z = obs_pos
-    r = np.linalg.norm([x, y, z])
-    theta = np.arccos(z / r)
-    phi = np.arctan2(y, x)
-    e_r = np.array([np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), np.cos(theta)])
-    e_theta = np.array([np.cos(theta)*np.cos(phi), np.cos(theta)*np.sin(phi), -np.sin(theta)])
-    e_phi = np.array([-np.sin(phi), np.cos(phi), 0])
-    pr = np.dot(ray_dir, e_r)
-    ptheta = np.dot(ray_dir, e_theta)
-    pphi = np.dot(ray_dir, e_phi)
-    return pr, ptheta, pphi
 
 def emit_photon_worker(args):
     """
@@ -33,19 +21,13 @@ def emit_photon_worker(args):
         steps, delta, omega, rtol, atol, order, suppress_warnings, bg_array,
         patch_center_theta, patch_center_phi, patch_size_theta, patch_size_phi, flip_theta, flip_phi
     ) = args
-    ray_dir = pixel_pos - observer_pos
-    ray_dir = ray_dir / np.linalg.norm(ray_dir)
-    x, y, z = observer_pos
-    r = np.linalg.norm([x, y, z])
-    th = np.arccos(z / r)
-    ph = np.arctan2(y, x)
-    pr, ptheta, pphi = cartesian_to_spherical_momentum(ray_dir, observer_pos)
-    momentum = np.array([0.0, pr, ptheta, pphi])
+    # Use get_initial_conditions for robust direction-to-momentum conversion
+    q0, p0 = get_initial_conditions(observer_pos, pixel_pos)
     geod = Nulllike(
         metric="Schwarzschild",
         metric_params=(),
-        position=[r, th, ph],
-        momentum=momentum[1:],
+        position=q0[1:],
+        momentum=p0[1:],
         steps=steps,
         delta=delta,
         omega=omega,
@@ -111,10 +93,10 @@ def run_manual_simulation(
     bh, observer, real_time=False, update_every=32,
     steps=500, delta=0.2, omega=1.0, rtol=1e-2, atol=1e-2, order=2, suppress_warnings=False,
     background_path=None, use_cuda=False,
+    boundary_radius=None,
     patch_center_theta=np.pi/2, patch_center_phi=0, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
     flip_theta=False, flip_phi=False,
-    return_sampled_trajectories=False,
-    n_sampled=10
+    n_samples=0
 ):
     """
     Run manual ray tracing simulation with tqdm progress bar.
@@ -134,18 +116,22 @@ def run_manual_simulation(
     img = np.zeros((h, w, 3), dtype=np.uint8)
     sampled_trajectories = []
     sampled_indices = set()
-    if return_sampled_trajectories:
+    if n_samples > 0:
         import random
-        while len(sampled_indices) < n_sampled:
+        while len(sampled_indices) < n_samples:
             i = random.randint(0, h-1)
             j = random.randint(0, w-1)
             sampled_indices.add((i, j))
 
     # Image plane geometry (robust pinhole camera model)
+    
+    # get position of observer and black hole
     obs_pos = np.array(observer.position)
     bh_pos = np.array(bh.position) if hasattr(bh, 'position') else np.zeros(3)
+    #define the optical axis (should be in the (negative) x direction)
     optical_axis = (bh_pos - obs_pos)
     optical_axis = optical_axis / np.linalg.norm(optical_axis)
+    #define the up vector (related to the pixels of the image plane) (should be in the z direction)
     up_guess = np.array([0, 0, 1])
     if np.allclose(np.cross(optical_axis, up_guess), 0):
         up_guess = np.array([0, 1, 0])
@@ -167,48 +153,64 @@ def run_manual_simulation(
             pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
             pixel_positions[i, j] = pixel_pos
 
+    if boundary_radius is None:
+        boundary_radius = 10 * bh.rs
+
     if use_cuda:
-        logging.info("Using CUDA Schwarzschild integrator for ray tracing...")
-        rel_pos = observer.position - bh.position
-        r = np.linalg.norm(rel_pos)
-        th = np.arccos(rel_pos[2] / r)
-        ph0 = np.arctan2(rel_pos[1], rel_pos[0])
+        logging.info("Using CUDA Schwarzschild integrator for curved rays ...")
+        from simulation.cuda_geodesic import CUDASchwarzschildIntegrator, compute_null_4momentum_schwarzschild
+
+        # Prepare initial conditions for all rays
         q0s = np.zeros((h*w, 4), dtype=np.float64)
         p0s = np.zeros((h*w, 4), dtype=np.float64)
-        for idx, (i, j) in enumerate([(i, j) for i in range(h) for j in range(w)]):
+        for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="CUDA post-processing", unit="ray"):
             q0, p0 = get_initial_conditions(obs_pos, pixel_positions[i, j])
-            q0s[i*w+j, :] = q0
-            p0s[i*w+j, :] = p0
-        cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass)
-        out_qs, out_ps = cuda_integrator.integrate_batch(q0s, p0s)
-        photon_rows = []
-        # For sampled trajectories
-        sampled_traj_indices = [i*w+j for (i, j) in sampled_indices] if return_sampled_trajectories else []
+            # Set temporal component via null condition
+            p0[0] = compute_null_4momentum_schwarzschild(q0, p0[1:])[0]
+            q0s[idx] = q0
+            p0s[idx] = p0
+
+        cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass, r_max=boundary_radius)
+        out_qs, _ = cuda_integrator.integrate_batch(q0s, p0s)
+
+        # Handle sampled trajectories
         sampled_traj_data = []
-        for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="CUDA Ray tracing", unit="ray"):
-            x, y, z = out_qs[idx, 1], out_qs[idx, 2], out_qs[idx, 3]  # r, theta, phi
-            r_bh = x  # r
-            q0 = q0s[i*w+j]
-            p0 = p0s[i*w+j]
+        if n_samples > 0 and len(sampled_indices) > 0:
+            sample_flat_idx = np.array([i*w + j for (i, j) in sampled_indices], dtype=np.int64)
+            q0s_samples = q0s[sample_flat_idx]
+            p0s_samples = p0s[sample_flat_idx]
+            traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples)
+            # Convert to Cartesian for each sample
+            for s in range(len(sample_flat_idx)):
+                traj_cart = []
+                for step in range(traj_out.shape[1]):
+                    t, r, th, ph = traj_out[s, step]
+                    x = r * np.sin(th) * np.cos(ph)
+                    y = r * np.sin(th) * np.sin(ph)
+                    z = r * np.cos(th)
+                    traj_cart.append([x, y, z])
+                sampled_traj_data.append(np.array(traj_cart))
+
+        # Build image colours
+        photon_rows = []
+        for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="CUDA post-processing", unit="ray"):
+            r_bh = out_qs[idx, 1]
+            th_hit = out_qs[idx, 2]
+            ph_hit = out_qs[idx, 3]
+
             collision = ''
             bg_u = bg_v = rgb = None
-
-            # Category 1: captured by BH -> Black
             if r_bh <= bh.rs:
                 value = (0, 0, 0)
                 collision = 'bh'
-
-            # Category 2: Escaped the domain (r >= r_shell)
-            elif r_bh >= 10 * bh.rs:
+            elif r_bh >= boundary_radius:
                 if bg_array is not None:
-                    hit_theta = out_qs[idx, 2]
-                    hit_phi = out_qs[idx, 3]
-                    dtheta = np.abs(hit_theta - patch_center_theta)
-                    dphi = np.abs((hit_phi - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
+                    dtheta = np.abs(th_hit - patch_center_theta)
+                    dphi = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
                     inside_patch = (dtheta <= patch_size_theta/2) and (dphi <= patch_size_phi/2)
                     if inside_patch:
-                        theta_map = (np.pi - hit_theta) if flip_theta else hit_theta
-                        phi_map = (-hit_phi) if flip_phi else hit_phi
+                        theta_map = (np.pi - th_hit) if flip_theta else th_hit
+                        phi_map = (-ph_hit) if flip_phi else ph_hit
                         u = int((theta_map / np.pi) * (h - 1))
                         v = int(((phi_map + np.pi) / (2 * np.pi)) * (w - 1))
                         u = min(max(u, 0), h - 1)
@@ -218,49 +220,32 @@ def run_manual_simulation(
                         rgb = value
                         collision = 'escape_bg'
                     else:
-                        value = (0, 0, 255)  # Blue
+                        value = (0, 0, 255)
                         collision = 'escape_no_patch'
                 else:
-                    value = (0, 0, 255)  # Blue even without background
+                    value = (0, 0, 255)
                     collision = 'escape_no_patch'
-
-            # Category 3: Still inside domain after integration steps -> Red
             else:
                 value = (255, 0, 0)
                 collision = 'in_domain'
             img[i, j] = value
-            photon_rows.append({
-                'i': i, 'j': j,
-                'q0_t': q0[0], 'q0_r': q0[1], 'q0_th': q0[2], 'q0_ph': q0[3],
-                'p0_t': p0[0], 'p0_r': p0[1], 'p0_th': p0[2], 'p0_ph': p0[3],
-                'final_r': x, 'final_th': y, 'final_ph': z,
-                'collision': collision,
-                'bg_u': bg_u, 'bg_v': bg_v,
-                'rgb': rgb
-            })
-            # Save trajectory for sampled indices
-            if return_sampled_trajectories and idx in sampled_traj_indices:
-                # For CUDA, we only have the final point, so just store start and end in Cartesian
-                r0, th0, ph0 = q0[1], q0[2], q0[3]
-                x0 = r0 * np.sin(th0) * np.cos(ph0)
-                y0 = r0 * np.sin(th0) * np.sin(ph0)
-                z0 = r0 * np.cos(th0)
-                r1, th1, ph1 = x, y, z
-                x1 = r1 * np.sin(th1) * np.cos(ph1)
-                y1 = r1 * np.sin(th1) * np.sin(ph1)
-                z1 = r1 * np.cos(th1)
-                sampled_traj_data.append(np.array([[x0, y0, z0], [x1, y1, z1]]))
-        df = pd.DataFrame(photon_rows)
-        df.to_csv('photon_data.csv', index=False)
-        print(f"Saved photon data for {len(df)} photons to photon_data.csv")
-        logging.info("CUDA ray tracing simulation completed.")
-        if return_sampled_trajectories:
-            return img, sampled_traj_data
+            photon_rows.append({'i': i, 'j': j, 'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit, 'collision': collision})
+
+        pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False)
+
+        # Save sampled trajectories CSV
+        if n_samples > 0 and sampled_traj_data:
+            rows = []
+            for ridx, traj in enumerate(sampled_traj_data):
+                for pidx, (px, py, pz) in enumerate(traj):
+                    rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz})
+            pd.DataFrame(rows).to_csv('sampled_rays.csv', index=False)
+        sampled_trajectories = sampled_traj_data
     else:
         # CPU fallback (original code)
         args_list = [
             (
-                bh.rs, bh.position, observer.position, 10 * bh.rs, pixel_positions[i, j], (i, j),
+                bh.rs, bh.position, observer.position, boundary_radius, pixel_positions[i, j], (i, j),
                 steps, delta, omega, rtol, atol, order, suppress_warnings, bg_array,
                 patch_center_theta, patch_center_phi, patch_size_theta, patch_size_phi, flip_theta, flip_phi
             )
@@ -291,6 +276,6 @@ def run_manual_simulation(
         print(f"Summary: {n_captured} rays captured by BH, {n_escaped} rays escaped, {n_bg} rays hit the background image.")
     else:
         print("Summary counts not available (CPU fallback mode).")
-    if return_sampled_trajectories:
-        return img, sampled_traj_data
+    if n_samples > 0:
+        return img, sampled_trajectories
     return img 
