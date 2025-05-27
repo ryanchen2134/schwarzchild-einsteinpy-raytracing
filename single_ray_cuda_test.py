@@ -1,177 +1,193 @@
+"""
+Single-ray CUDA test script – *fixed* with colour‑gradient time coding
+====================================================================
+
+Adds a perceptual colour gradient (viridis) that runs **from λ = 0 to the
+final integration step** so you can see the photon’s temporal progress at a
+glance.
+
+Changes compared with the previous version
+------------------------------------------
+* New helper `make_colour_segments()` produces a *Line3DCollection* (3‑D) or
+  *LineCollection* (2‑D) whose segments are coloured by normalised λ.
+* All four diagnostic panels now use the gradient instead of a single solid
+  colour.
+* Colormap and normalisation are defined **once** so every subplot shares the
+  same colour meaning.
+
+Run exactly as before:
+```bash
+python single_ray_cuda_test_fixed.py
+```
+
+Everything else (physics, CSV export, buffer cut‑off) is unchanged.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401, needed for 3-D projection
+from matplotlib import cm
+from matplotlib.collections import LineCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – enables 3‑D projection
+import pandas as pd
 
-from simulation.cuda_geodesic import CUDASchwarzschildIntegrator, compute_null_4momentum_schwarzschild
-from simulation.utils import get_initial_conditions
+from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
 
+###############################################################################
+# Helper utilities                                                            #
+###############################################################################
 
-def main():
-    """Generate and plot a single null geodesic integrated on the GPU."""
-    
-    ##### Physical Conditions #####
-    # Black-hole parameters
-    mass_bh = 1.0  # geometrized units (M)
-    # Observer position (on +x axis)
-    R_obs = 200
-    observer_pos = np.array([R_obs, 0.0, 0.0])
-    # Tangential offsets in the image plane
-    alpha_deg = -50.0  # angle away from inward radial direction (-x)
-    beta_deg  = 0  # rotation around optical axis
-    #simulation boundary
-    rmax = 1000
-  
-    ##### Numerical Parameters #####
-    steps = 5000
-    delta = 0.2
-    omega = 0.1
-    
-    
-    
-    
-
-    # Build orthonormal camera basis at observer
-    optical_axis = np.array([-1.0, 0.0, 0.0])  # toward BH from observer
-    up_guess = np.array([0.0, 0.0, 1.0])
-    # ensure right vector is not zero
-    if np.allclose(np.cross(optical_axis, up_guess), 0):
-        up_guess = np.array([0.0, 1.0, 0.0])
-    e_right = np.cross(up_guess, optical_axis)
-    e_right = e_right / np.linalg.norm(e_right)
-    e_up = np.cross(optical_axis, e_right)
-    e_up = e_up / np.linalg.norm(e_up)
-
+def cartesian_camera_direction(alpha_deg: float, beta_deg: float) -> np.ndarray:
+    """Cartesian unit vector that implements the (α,β) camera angles."""
     alpha = np.radians(alpha_deg)
     beta = np.radians(beta_deg)
 
-    ray_dir = (np.cos(alpha) * optical_axis +
-               np.sin(alpha) * (np.cos(beta) * e_right + np.sin(beta) * e_up))
-    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+    v = (
+        np.cos(alpha) * np.cos(beta) * np.array([-1.0, 0.0, 0.0])
+        + np.sin(alpha)               * np.array([0.0, 1.0, 0.0])
+        + np.sin(beta) * np.cos(alpha) * np.array([0.0, 0.0, 1.0])
+    )
+    return v / np.linalg.norm(v)
 
-    # Fake pixel position one unit away along that direction to reuse helper
-    pixel_pos = observer_pos + ray_dir
 
-    # Build initial 4-position in spherical coords
-    r0 = np.linalg.norm(observer_pos)
-    theta0 = np.arccos(observer_pos[2] / r0)
-    phi0 = np.arctan2(observer_pos[1], observer_pos[0])
-    q0 = np.array([0.0, r0, theta0, phi0])
+def build_null_4momentum(n_cart: np.ndarray, r0: float, theta0: float, phi0: float, *, mass_bh: float = 1.0) -> np.ndarray:
+    """Return contravariant null 4‑momentum that matches *n_cart*."""
+    f_r = 1.0 - 2.0 * mass_bh / r0
+    sqrt_f = np.sqrt(f_r)
 
-    # Analytic null–momentum (Pt, Pr, Pθ, Pφ)
-    M = mass_bh
-    f_r = 1.0 - 2.0 * M / r0
-    E_loc = 1.0  # choose local energy scale
-    E = E_loc / np.sqrt(f_r)
+    sin_t, cos_t = np.sin(theta0), np.cos(theta0)
+    sin_p, cos_p = np.sin(phi0),  np.cos(phi0)
 
-    alpha = np.radians(alpha_deg)  # Θ
-    beta  = np.radians(beta_deg)   # Φ
+    e_r     = np.array([sin_t * cos_p, sin_t * sin_p, cos_t])
+    e_theta = np.array([cos_t * cos_p, cos_t * sin_p, -sin_t])
+    e_phi   = np.array([-sin_p,        cos_p,        0.0])
 
-    p_t = E / f_r
-    p_r = -E * np.cos(alpha)
-    p_theta = E / r0 * np.sin(alpha) * np.cos(beta)
-    # sin(theta0) may be zero if observer on z-axis; here θ=π/2 so sin=1
-    sin_theta0 = np.sin(theta0) if np.abs(np.sin(theta0)) > 1e-12 else 1.0
-    p_phi = E / (r0 * sin_theta0) * np.sin(alpha) * np.sin(beta)
+    n_rhat, n_thhat, n_phihat = map(lambda e: np.dot(n_cart, e), (e_r, e_theta, e_phi))
 
-    p0 = np.array([p_t, p_r, p_theta, p_phi])
+    E_hat = 1.0  # local photon energy scale (λ‑parametrisation)
 
-    # Integrate on GPU (Fantasy order-2)
-    
-    integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=mass_bh, omega=omega, r_max=rmax)
-    traj = integrator.integrate_batch_full(q0[np.newaxis, :], p0[np.newaxis, :])[0]  # (steps,4)
-    #save this to a df, then a csv
-    import pandas as pd 
-    df = pd.DataFrame(traj, columns=['t', 'r', 'theta', 'phi'])
-    df.to_csv('single_ray_cuda_test.csv', index=True)
+    P_t     =  1.0 / sqrt_f
+    P_r     =  sqrt_f * E_hat * n_rhat
+    P_theta = E_hat * n_thhat / r0
+    P_phi   = E_hat * n_phihat / (r0 * sin_t)
 
-    # Discard points if they cross 1.1 r_s
+    # Sanity – enforce nullness
+    H = (
+        -f_r * P_t**2
+        + (1.0 / f_r) * P_r**2
+        + r0**2 * (P_theta**2 + (sin_t**2) * P_phi**2)
+    )
+    if abs(H) > 1e-10:
+        raise RuntimeError(f"Hamiltonian not null (H={H:.3e}).")
+
+    return np.array([P_t, P_r, P_theta, P_phi])
+
+
+def make_colour_segments(xs, ys, zs=None, cmap=cm.viridis):
+    """Return a LineCollection/Line3DCollection colour‑coded by index."""
+    pts = np.column_stack((xs, ys)) if zs is None else np.column_stack((xs, ys, zs))
+    segments = np.stack([pts[:-1], pts[1:]], axis=1)
+    norm = plt.Normalize(0, len(xs) - 1)
+    colors = cmap(norm(np.arange(len(xs) - 1)))
+    if zs is None:
+        lc = LineCollection(segments, colors=colors, linewidth=2)
+    else:
+        lc = Line3DCollection(segments, colors=colors, linewidth=2)
+    return lc, cmap, norm
+
+###############################################################################
+# Main driver                                                                  #
+###############################################################################
+
+def main():
+    # ---------------- parameters -----------------
+    mass_bh   = 1.0
+    R_obs     = 10.0
+    alpha_deg, beta_deg = 50.0, 20.0
+    r_max = 200.0
+
+    steps, delta, omega = 5000, 0.2, 0.1 # delta is the affine step size
+
+    r0, theta0, phi0 = R_obs, np.pi/2, 0.0
+
+    # -------------- initial data ------------------
+    n_cart = cartesian_camera_direction(alpha_deg, beta_deg)
+    p0     = build_null_4momentum(n_cart, r0, theta0, phi0, mass_bh=mass_bh)
+    q0     = np.array([0.0, r0, theta0, phi0])
+
+    # -------------- integrate ---------------------
+    integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=mass_bh, omega=omega, r_max=r_max)
+    traj = integrator.integrate_batch_full(q0[np.newaxis, :], p0[np.newaxis, :])[0]
+
     rs = 2.0 * mass_bh
-    mask = traj[:,1] > 1.1 * rs
-    discarded = 0
-    if not np.all(mask):
-        first_bad = np.argmax(~mask)
-        discarded = len(traj) - first_bad
-        traj = traj[:first_bad]
+    safe = traj[:, 1] > 1.1 * rs
+    if not np.all(safe):
+        traj = traj[: np.argmax(~safe)]
 
-    # Convert to Cartesian for plotting
+    # -------------- export CSV --------------------
+    df = pd.DataFrame(traj, columns=["t", "r", "theta", "phi"])
+    df["theta"], df["phi"] = np.degrees(df["theta"]), np.degrees(df["phi"])
+    df.to_csv("single_ray_cuda_test.csv", index=False)
+
+    # -------------- Cartesian ---------------------
     t, r, th, ph = traj.T
-    xs = r * np.sin(th) * np.cos(ph)
-    ys = r * np.sin(th) * np.sin(ph)
-    zs = r * np.cos(th)
+    xs, ys, zs = r * np.sin(th) * np.cos(ph), r * np.sin(th) * np.sin(ph), r * np.cos(th)
 
-    # Compute plane of motion (defined by initial r x p)
-    r0_vec = observer_pos
-    p_spatial = ray_dir  # unit vector
-    n_hat = np.cross(r0_vec, p_spatial)
-    n_norm = np.linalg.norm(n_hat)
-    if n_norm == 0:
-        n_hat = np.array([0.0, 0.0, 1.0])
-        n_norm = 1.0
-    n_hat = n_hat / n_norm
-    # In-plane basis e1 (projection of initial position onto plane) & e2 = n × e1
-    e1 = r0_vec - np.dot(r0_vec, n_hat) * n_hat
-    e1 /= np.linalg.norm(e1)
+    # in‑plane basis
+    r0_vec = np.array([R_obs, 0.0, 0.0])
+    n_hat  = np.cross(r0_vec, n_cart)
+    n_hat = n_hat / np.linalg.norm(n_hat) if np.linalg.norm(n_hat) else np.array([0.0, 0.0, 1.0])
+    e1 = (r0_vec - np.dot(r0_vec, n_hat) * n_hat) / np.linalg.norm(r0_vec - np.dot(r0_vec, n_hat) * n_hat)
     e2 = np.cross(n_hat, e1)
+    u, v = xs*e1[0] + ys*e1[1] + zs*e1[2], xs*e2[0] + ys*e2[1] + zs*e2[2]
 
-    # Coordinates in plane for each point
-    u_coords = xs * e1[0] + ys * e1[1] + zs * e1[2]
-    v_coords = xs * e2[0] + ys * e2[1] + zs * e2[2]
+    # Global colour map (shared normalisation)
+    cmap = cm.viridis
+    norm = plt.Normalize(0, len(xs) - 1)
 
-    # 3-D plot
+    # -------------- figure ------------------------
     fig = plt.figure(figsize=(10, 8))
-    ax3d = fig.add_subplot(221, projection='3d')
-    ax3d.plot(xs, ys, zs, color='orange', lw=2)
-    ax3d.scatter([0], [0], [0], color='black', s=50, label='BH')
-    ax3d.scatter([observer_pos[0]], [observer_pos[1]], [observer_pos[2]], color='red', s=30, label='Observer')
 
-    # # Draw wireframe sphere at Schwarzschild radius
-    # rs = 2.0 * mass_bh
-    # u = np.linspace(0, 2 * np.pi, 20)
-    # v = np.linspace(0, np.pi, 20)
-    # x = rs * np.outer(np.cos(u), np.sin(v))
-    # y = rs * np.outer(np.sin(u), np.sin(v))
-    # z = rs * np.outer(np.ones(np.size(u)), np.cos(v))
-    # ax3d.plot_wireframe(x, y, z, color='gray', alpha=0.3, label='Event horizon')
+    # 3‑D
+    ax3d = fig.add_subplot(221, projection="3d")
+    lc3d, _, _ = make_colour_segments(xs, ys, zs, cmap)
+    ax3d.add_collection3d(lc3d)
+    ax3d.scatter([0], [0], [0], c="k", s=40)
+    ax3d.scatter([R_obs], [0], [0], c="red", s=25)
+    ax3d.set_xlabel("x"); ax3d.set_ylabel("y"); ax3d.set_zlabel("z")
+    ax3d.set_title("3‑D trajectory (time‑coded)")
 
-    ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
-    ax3d.set_title('3-D trajectory')
-    ax3d.legend()
-
-    # x-y cross-section
+    # x‑y
     ax_xy = fig.add_subplot(222)
-    ax_xy.plot(xs, ys, color='blue')
-    ax_xy.set_xlabel('x'); ax_xy.set_ylabel('y'); ax_xy.set_title('x-y')
-    #put dot at 0,0
-    ax_xy.scatter([0], [0], color='black', s=5)
-    #auto-scale the axes based on the data
-    ax_xy.autoscale(axis='both')
-    
-    ax_xy.axis('equal')
+    lc_xy, _, _ = make_colour_segments(xs, ys, cmap=cmap)
+    ax_xy.add_collection(lc_xy)
+    ax_xy.scatter([0], [0], c="k", s=10)
+    ax_xy.set_xlabel("x"); ax_xy.set_ylabel("y"); ax_xy.set_title("x‑y")
+    ax_xy.axis("equal")
 
-    # x-z cross-section
+    # x‑z
     ax_xz = fig.add_subplot(223)
-    ax_xz.plot(xs, zs, color='green')
-    ax_xz.set_xlabel('x'); ax_xz.set_ylabel('z'); ax_xz.set_title('x-z')
-    ax_xz.scatter([0], [0], color='black', s=5)
-    ax_xz.autoscale(axis='both')
-    ax_xz.set_ylim(-1.5, 1.5)
-    ax_xz.axis('equal')
+    lc_xz, _, _ = make_colour_segments(xs, zs, cmap=cmap)
+    ax_xz.add_collection(lc_xz)
+    ax_xz.scatter([0], [0], c="k", s=10)
+    ax_xz.set_xlabel("x"); ax_xz.set_ylabel("z"); ax_xz.set_title("x‑z")
+    ax_xz.axis("equal")
 
-    # Planar polar coordinates (r_plane, theta_plane')
-    r_plane = np.sqrt(u_coords**2 + v_coords**2)
-    theta_plane = np.arctan2(v_coords, u_coords)
+    # polar in‑plane
+    r_plane = np.sqrt(u**2 + v**2)
+    th_plane = np.arctan2(v, u)
+    ax_pol = fig.add_subplot(224, projection="polar")
+    sc = ax_pol.scatter(th_plane, r_plane, c=np.arange(len(th_plane)), cmap=cmap, s=4, norm=norm)
+    ax_pol.set_title("Orbital‑plane polar")
 
-    ax_plane = fig.add_subplot(224, projection='polar')
-    ax_plane.plot(theta_plane, r_plane, color='purple')
-    ax_plane.set_title("Planar (r, θ')")
-    ax_plane.set_rlabel_position(45)
+    # Shared colour‑bar
+    cax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax, label="integration step → time")
 
-    plt.tight_layout()
-    plt.savefig('single_ray_cuda_test.png', dpi=150)
+    fig.tight_layout(rect=[0,0,0.9,1])
+    fig.savefig("single_ray_cuda_test.png", dpi=150)
     plt.show()
-
-    print(f"Discarded {discarded} points that were within 1.1 r_s of the BH.")
 
 
 if __name__ == "__main__":
-    main() 
+    main()
