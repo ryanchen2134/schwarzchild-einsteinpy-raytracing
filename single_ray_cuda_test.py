@@ -37,17 +37,6 @@ from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
 # Helper utilities                                                            #
 ###############################################################################
 
-def cartesian_camera_direction(alpha_deg: float, beta_deg: float) -> np.ndarray:
-    """Cartesian unit vector that implements the (α,β) camera angles."""
-    alpha = np.radians(alpha_deg)
-    beta = np.radians(beta_deg)
-
-    v = (
-        np.cos(alpha) * np.cos(beta) * np.array([-1.0, 0.0, 0.0])
-        + np.sin(alpha)               * np.array([0.0, 1.0, 0.0])
-        + np.sin(beta) * np.cos(alpha) * np.array([0.0, 0.0, 1.0])
-    )
-    return v / np.linalg.norm(v)
 
 
 def build_null_4momentum(n_cart: np.ndarray, r0: float, theta0: float, phi0: float, *, mass_bh: float = 1.0) -> np.ndarray:
@@ -102,18 +91,47 @@ def make_colour_segments(xs, ys, zs=None, cmap=cm.viridis):
 def main():
     # ---------------- parameters -----------------
     mass_bh   = 1.0
-    R_obs     = 10.0
-    alpha_deg, beta_deg = 50.0, 20.0
-    r_max = 200.0
+    
+    r_max =1000
+    steps, delta, omega = 10000, 0.05, 0.01 # delta is the affine step size
+    
+    theta0, phi0 = np.pi/2, 0.0
+    
+    R_obs = 4.0                     # same as r0
+    r0    = R_obs                   # keep a single source of truth
 
-    steps, delta, omega = 5000, 0.2, 0.1 # delta is the affine step size
+    alpha_deg = 60                  # right-hand deflection (towards +y)
+    beta_deg  = 60                  # upward deflection   (towards +z)
 
-    r0, theta0, phi0 = R_obs, np.pi/2, 0.0
+    alpha = np.deg2rad(alpha_deg)
+    beta  = np.deg2rad(beta_deg)
+    
+    n_cart = np.array([
+    -np.cos(alpha)*np.cos(beta),   # x
+     np.sin(alpha)*np.cos(beta),   # y
+     np.sin(beta)                  # z
+    ])
+    n_cart /= np.linalg.norm(n_cart) 
+    
+    
+    # ------------------------------------------------------------
+    # 3)  Project n_cart onto the local orthonormal spherical basis
+    #     At (θ₀=π/2, φ₀=0):
+    #       r̂      = ( 1, 0, 0)
+    #       θ̂      = ( 0, 0,-1)
+    #       φ̂      = ( 0, 1, 0)
+    # ------------------------------------------------------------
+    n_rhat   =  n_cart[0]              #  dot(n_cart, r̂)
+    n_thhat  = -n_cart[2]              #  dot(n_cart, θ̂)
+    n_phihat =  n_cart[1]              #  dot(n_cart, φ̂)
 
-    # -------------- initial data ------------------
-    n_cart = cartesian_camera_direction(alpha_deg, beta_deg)
-    p0     = build_null_4momentum(n_cart, r0, theta0, phi0, mass_bh=mass_bh)
-    q0     = np.array([0.0, r0, theta0, phi0])
+
+    q0 = np.array([0.0, r0, theta0, phi0])                    # (t,r,θ,φ)
+    cart = np.array([n_rhat, n_thhat, n_phihat])     # components
+    p0 = build_null_4momentum(cart, r0, theta0, phi0,
+                          mass_bh=mass_bh)
+    
+    print(f"p0: {p0}")
 
     # -------------- integrate ---------------------
     integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=mass_bh, omega=omega, r_max=r_max)
