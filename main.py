@@ -1,3 +1,4 @@
+#main.py
 import argparse
 import logging
 from config import parse_args
@@ -52,7 +53,7 @@ def main():
             flip_theta=args.bg_flip_theta,
             flip_phi=args.bg_flip_phi,
             return_sampled_trajectories=True,
-            n_sampled=20,
+            n_sampled=10,
             override_patch_center=False
         )
         flat_trajectories = sampled_trajectories
@@ -76,6 +77,7 @@ def main():
         suppress_warnings=args.suppress_warnings,
         background_path=args.background,
         use_cuda=args.cuda,
+        boundary_radius=boundary_radius,
         patch_center_theta=np.deg2rad(args.bg_patch_center_theta),
         patch_center_phi=np.deg2rad(args.bg_patch_center_phi),
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),

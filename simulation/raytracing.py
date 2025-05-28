@@ -1,3 +1,4 @@
+# raytracing.py
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import matplotlib.pyplot as plt
@@ -22,7 +23,8 @@ def emit_photon_worker(args):
         patch_center_theta, patch_center_phi, patch_size_theta, patch_size_phi, flip_theta, flip_phi
     ) = args
     # Use get_initial_conditions for robust direction-to-momentum conversion
-    q0, p0 = get_initial_conditions(observer_pos, pixel_pos)
+    mass_bh = bh_rs / 2.0
+    q0, p0 = get_initial_conditions(observer_pos, pixel_pos, mass_bh=mass_bh)
     geod = Nulllike(
         metric="Schwarzschild",
         metric_params=(),
@@ -58,7 +60,7 @@ def emit_photon_worker(args):
         prev_r_bh = r_bh
 
         # 1. Photon captured by BH -> Black and terminate
-        if r_bh <= bh_rs:
+        if r_bh <= bh_rs*1.1:
             return mesh_idx, (0, 0, 0)
 
         # 2. Photon has crossed the outer boundary (r_shell) -> may hit background or be blue
@@ -153,20 +155,18 @@ def run_manual_simulation(
             pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
             pixel_positions[i, j] = pixel_pos
 
-    if boundary_radius is None:
-        boundary_radius = 10 * bh.rs
+    # if boundary_radius is None:
+    #     boundary_radius = 10 * bh.rs
 
     if use_cuda:
         logging.info("Using CUDA Schwarzschild integrator for curved rays ...")
-        from simulation.cuda_geodesic import CUDASchwarzschildIntegrator, compute_null_4momentum_schwarzschild
+        from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
 
         # Prepare initial conditions for all rays
         q0s = np.zeros((h*w, 4), dtype=np.float64)
         p0s = np.zeros((h*w, 4), dtype=np.float64)
         for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="CUDA post-processing", unit="ray"):
-            q0, p0 = get_initial_conditions(obs_pos, pixel_positions[i, j])
-            # Set temporal component via null condition
-            p0[0] = compute_null_4momentum_schwarzschild(q0, p0[1:])[0]
+            q0, p0 = get_initial_conditions(obs_pos, pixel_positions[i, j], mass_bh=bh.mass)
             q0s[idx] = q0
             p0s[idx] = p0
 
@@ -200,15 +200,19 @@ def run_manual_simulation(
 
             collision = ''
             bg_u = bg_v = rgb = None
-            if r_bh <= bh.rs:
+            # photon getting very close or captured, or heading vector (dot) the inward radial vector is less than or
+            #equal to the cosine (projection) of the angle generated (arctan) by the current radial distance and the schwarzschild radius
+            # or (np.dot(np.array[-1,0,0], out_qs[idx, 1:4]) <= np.cos(np.arctan(bh.rs/2/np.linalg.norm(r_bh)))):
+            if r_bh <= bh.rs*1.1 :
                 value = (0, 0, 0)
                 collision = 'bh'
             elif r_bh >= boundary_radius:
                 if bg_array is not None:
                     dtheta = np.abs(th_hit - patch_center_theta)
                     dphi = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
-                    inside_patch = (dtheta <= patch_size_theta/2) and (dphi <= patch_size_phi/2)
-                    if inside_patch:
+                    inside_patch_angle = (dtheta <= patch_size_theta/2) and (dphi <= patch_size_phi/2)
+                    # pi/2 <= phi <= 3pi/2 
+                    if inside_patch_angle and (np.pi/2 <= ph_hit <= 3*np.pi/2):
                         theta_map = (np.pi - th_hit) if flip_theta else th_hit
                         phi_map = (-ph_hit) if flip_phi else ph_hit
                         u = int((theta_map / np.pi) * (h - 1))

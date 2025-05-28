@@ -1,3 +1,4 @@
+#blackhole.py
 import numpy as np
 
 class BlackHole:
