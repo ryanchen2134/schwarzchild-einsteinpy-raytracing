@@ -6,6 +6,35 @@ import math
 # -----------------------------------------------------------------------------
 # Helper: exact EinsteinPy-style null 4-momentum in Schwarzschild coordinates
 # -----------------------------------------------------------------------------
+# ------------------------- Helper: null 4-momentum ---------------------------
+def compute_null_4momentum_schwarzschild(q, p_spatial):
+    """Given spatial momentum (p^r, p^θ, p^φ) compute p^t so that g_{ab}p^a p^b = 0."""
+    r = q[1]
+    th = q[2]
+    if r <= 2.0:
+        r = 2.0 + 1e-8
+    g_tt = -(1.0 - 2.0 / r)
+    g_rr = 1.0 / (1.0 - 2.0 / r)
+    g_thth = r * r
+    g_phph = r * r * np.sin(th) ** 2
+    pr, pth, pph = p_spatial
+    C = g_rr * pr * pr + g_thth * pth * pth + g_phph * pph * pph
+    # Null condition: g_tt (p^t)^2 + C = 0  ->  p^t = ±sqrt(-C/g_tt)
+    pt = np.sqrt(max(0.0, -C / g_tt))
+    return [-pt, pr, pth, pph]  # negative root for consistency with EPy
+
+
+def _apply_relative_offsets(theta_base_deg, phi_base_deg,
+                            dtheta_deg=0.0, dphi_deg=0.0):
+    """Return new θ,φ after adding small observer-relative offsets (deg)."""
+    theta_base = np.deg2rad(theta_base_deg)
+    phi_base = np.deg2rad(phi_base_deg)
+    dθ = np.deg2rad(dtheta_deg)
+    dφ = np.deg2rad(dphi_deg)
+    θ  = np.clip(theta_base + dθ, 0.0, np.pi)
+    φ  = (phi_base  + dφ) % (2*np.pi)
+    return θ, φ
+
 
 def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
     """Return contravariant null 4-momentum p^μ = (p^t, p^r, p^θ, p^φ).
@@ -59,12 +88,14 @@ def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
     return np.array([p_t, pr, pth, pph])
 
 def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
-    """Return (`q0`, `p0`) for a photon launched from *observer_pos* towards
+    """Return (`q0`, `p0`, 'alpha) for a photon launched from *observer_pos* towards
     *pixel_pos*.
 
     • `q0` is the 4-position `(t=0, r, θ, φ)` in Schwarzschild coordinates.
     • `p0` is the **full** contravariant null 4-momentum `(p^t, p^r, …)` that
       satisfies `g_{μν} p^μ p^ν = 0`.
+    • `alpha` is the angle between the ray and the optical axis (in radians) in flat geometry
+        (useful later for mapping the ray to the background image and determining BH-bound rays)
 
     The routine follows the derivation showcased in *single_ray_cuda_test.py*
     for robustness and mass-dependency, superseding previous uses of
@@ -85,10 +116,14 @@ def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
     _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, x, y, z)
     
     
-    # 3) convert direction vector to spherical momentum components
+    # 3) convert direction vector to spherical momentum coordinate components of the 
+    # rhat, phi hat, theta hat basis vectors, normalized
     
     p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
     
+    p_r = p_spatial[0] * r_obs # needs to be renormalized since the component was streched due to 
+                                    # geometrised units
+    alpha = np.arccos(-p_r) # the dot product of the momentum and the optical axis
 
    
     # 5) full 4-momentum via null condition ---------------------------------
@@ -100,7 +135,7 @@ def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
     # 6) final 4-position ----------------------------------------------------
     q0 = np.array([0.0, r, theta, phi])
 
-    return q0, p0
+    return q0, p0, alpha
 
 # -----------------------------------------------------------------------------
 # Helper: angles (α,β) → spherical momentum components
@@ -134,7 +169,7 @@ def angles_to_p_sph(alpha, beta, r_obs, *, normalise=True):
 
     # 2) optional normalisation
     if normalise:
-        norm = math.sqrt(n_rhat**2 + n_thhat**2 + n_phhat**2)
+        norm = np.linalg.norm(np.array([n_rhat, n_thhat, n_phhat]))
         n_rhat, n_thhat, n_phhat = n_rhat/norm, n_thhat/norm, n_phhat/norm
 
     # 3) convert orthonormal → coordinate basis components

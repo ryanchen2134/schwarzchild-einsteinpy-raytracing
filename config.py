@@ -19,8 +19,12 @@ def parse_args():
     parser.add_argument('--boundary-radius', type=float, default=10, help='Simulation boundary radius (default: 10*bh_mass)')
     parser.add_argument('--observer-distance', type=float, default=9, help='Observer distance from BH (default: 20*bh_mass)')
     # Background patch configurables
-    parser.add_argument('--bg-patch-center-theta', type=float, default=90, help='Background patch center theta (deg, default: 90)')
-    parser.add_argument('--bg-patch-center-phi', type=float, default=0, help='Background patch center phi (deg, default: 0)')
+    parser.add_argument('--bg-patch-center-theta', type=float, default=90, help='Background patch center theta in degrees(deg, default: 90)')
+    parser.add_argument('--bg-patch-center-phi', type=float, default=180, help='Background patch center phi in degrees (deg, default: 180)')
+    
+    parser.add_argument('--bg-patch-center-theta-relobs', type=float, default=0, help='Background patch center theta offset (+ up / - down) in degrees relative to optical axis (deg, default: 0)')
+    parser.add_argument('--bg-patch-center-phi-relobs', type=float, default=0, help='Background patch center phi offset (+ right / - left) in degrees relative to optical axis (deg, default: 0)')
+    
     parser.add_argument('--bg-patch-size-theta', type=float, default=10, help='Background patch size theta (deg, default: 10)')
     parser.add_argument('--bg-patch-size-phi', type=float, default=10, help='Background patch size phi (deg, default: 10)')
     parser.add_argument('--bg-flip-theta', action='store_true', help='Flip theta mapping for background patch')

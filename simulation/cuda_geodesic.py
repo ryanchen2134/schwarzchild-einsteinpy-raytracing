@@ -53,15 +53,15 @@ def _flat_raytrace_kernel(obs_pos, ray_dirs, boundary_radius,
         out_img[i, 1] = 0
         out_img[i, 2] = 0
         return
-    t = (-b + math.sqrt(disc)) / (2.0 * a)
+    t = (-b + np.sqrt(disc)) / (2.0 * a)
     hx = ox + t * dx
     hy = oy + t * dy
     hz = oz + t * dz
 
     # ---------- Convert hit-point to spherical coords ----------
-    r = math.sqrt(hx * hx + hy * hy + hz * hz)
-    theta = math.acos(hz / r)
-    phi = math.atan2(hy, hx)
+    r = np.sqrt(hx * hx + hy * hy + hz * hz)
+    theta = np.acos(hz / r)
+    phi = np.atan2(hy, hx)
 
     # ---------- Check if hit point lies inside the user patch ----------
     theta0 = patch_center_theta - patch_size_theta * 0.5
@@ -70,13 +70,13 @@ def _flat_raytrace_kernel(obs_pos, ray_dirs, boundary_radius,
     phi1   = patch_center_phi   + patch_size_phi   * 0.5
 
     # Handle wrapping in phi
-    phi_span = (phi1 - phi0) % (2.0 * math.pi)
+    phi_span = (phi1 - phi0) % (2.0 * np.pi)
     if phi_span == 0.0:
-        phi_span = 2.0 * math.pi
+        phi_span = 2.0 * np.pi
     # Normalise angles to [0, 2π)
-    phi_mod     = phi % (2.0 * math.pi)
-    phi0_mod    = phi0 % (2.0 * math.pi)
-    phi1_mod    = phi1 % (2.0 * math.pi)
+    phi_mod     = phi % (2.0 * np.pi)
+    phi0_mod    = phi0 % (2.0 * np.pi)
+    phi1_mod    = phi1 % (2.0 * np.pi)
 
     in_phi_patch = False
     if phi0_mod <= phi1_mod:
@@ -86,11 +86,11 @@ def _flat_raytrace_kernel(obs_pos, ray_dirs, boundary_radius,
 
     if (theta >= theta0) and (theta <= theta1) and in_phi_patch:
         # Map to background texture coordinates
-        theta_map = (math.pi - theta) if flip_theta else theta
+        theta_map = (np.pi - theta) if flip_theta else theta
         phi_map   = (-phi)           if flip_phi  else phi
 
         u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
-        phi_map_mod = (phi_map - phi0) % (2.0 * math.pi)
+        phi_map_mod = (phi_map - phi0) % (2.0 * np.pi)
         v = int(phi_map_mod / phi_span * (w - 1))
 
         # Clamp
@@ -145,7 +145,7 @@ def _flat_raytrace_kernel_with_traj(obs_pos, ray_dirs, boundary_radius,
         out_img[i, 1] = 0
         out_img[i, 2] = 0
         return
-    t = (-b + math.sqrt(disc)) / (2.0 * a)
+    t = (-b + np.sqrt(disc)) / (2.0 * a)
     hx = ox + t * dx
     hy = oy + t * dy
     hz = oz + t * dz
@@ -163,21 +163,21 @@ def _flat_raytrace_kernel_with_traj(obs_pos, ray_dirs, boundary_radius,
                 out_trajs[sidx, p, 2] = pz
 
     # ----- Map hit-point to texture (same code as above kernel) -----
-    r = math.sqrt(hx * hx + hy * hy + hz * hz)
-    theta = math.acos(hz / r)
-    phi = math.atan2(hy, hx)
+    r = np.sqrt(hx * hx + hy * hy + hz * hz)
+    theta = np.acos(hz / r)
+    phi = np.atan2(hy, hx)
 
     theta0 = patch_center_theta - patch_size_theta * 0.5
     theta1 = patch_center_theta + patch_size_theta * 0.5
     phi0   = patch_center_phi   - patch_size_phi   * 0.5
     phi1   = patch_center_phi   + patch_size_phi   * 0.5
-    phi_span = (phi1 - phi0) % (2.0 * math.pi)
+    phi_span = (phi1 - phi0) % (2.0 * np.pi)
     if phi_span == 0.0:
-        phi_span = 2.0 * math.pi
+        phi_span = 2.0 * np.pi
 
-    phi_mod  = phi % (2.0 * math.pi)
-    phi0_mod = phi0 % (2.0 * math.pi)
-    phi1_mod = phi1 % (2.0 * math.pi)
+    phi_mod  = phi % (2.0 * np.pi)
+    phi0_mod = phi0 % (2.0 * np.pi)
+    phi1_mod = phi1 % (2.0 * np.pi)
 
     in_phi_patch = False
     if phi0_mod <= phi1_mod:
@@ -186,10 +186,10 @@ def _flat_raytrace_kernel_with_traj(obs_pos, ray_dirs, boundary_radius,
         in_phi_patch = (phi_mod >= phi0_mod) or (phi_mod <= phi1_mod)
 
     if (theta >= theta0) and (theta <= theta1) and in_phi_patch:
-        theta_map = (math.pi - theta) if flip_theta else theta
+        theta_map = (np.pi - theta) if flip_theta else theta
         phi_map   = (-phi)           if flip_phi  else phi
         u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
-        phi_map_mod = (phi_map - phi0) % (2.0 * math.pi)
+        phi_map_mod = (phi_map - phi0) % (2.0 * np.pi)
         v = int(phi_map_mod / phi_span * (w - 1))
         if u < 0:
             u = 0
@@ -308,7 +308,7 @@ def _schw_christoffel(q, rs, Gamma):
     th = q[2]
     if r <= rs:
         r = rs + 1e-12  # avoid divide-by-zero
-    sin_th = math.sin(th)
+    sin_th = np.sin(th)
     # Zero all elements first
     for a in range(4):
         for b in range(4):
@@ -325,11 +325,11 @@ def _schw_christoffel(q, rs, Gamma):
     # θ components
     Gamma[2, 1, 2] = 1.0 / r
     Gamma[2, 2, 1] = Gamma[2, 1, 2]
-    Gamma[2, 3, 3] = -sin_th * math.cos(th)
+    Gamma[2, 3, 3] = -sin_th * np.cos(th)
     # φ components
     Gamma[3, 1, 3] = 1.0 / r
     Gamma[3, 3, 1] = Gamma[3, 1, 3]
-    Gamma[3, 2, 3] = math.cos(th) / sin_th
+    Gamma[3, 2, 3] = np.cos(th) / sin_th
     Gamma[3, 3, 2] = Gamma[3, 2, 3]
 
 # ------------------------- Geodesic RHS (Hamilton) ---------------------------
@@ -420,22 +420,7 @@ class CUDASchwarzschildIntegrator:
         _integrate_batch_full[blocks, threads](q0s, p0s, self.steps, self.delta, self.rs, out_qs_traj)
         return out_qs_traj
 
-# ------------------------- Helper: null 4-momentum ---------------------------
-def compute_null_4momentum_schwarzschild(q, p_spatial):
-    """Given spatial momentum (p^r, p^θ, p^φ) compute p^t so that g_{ab}p^a p^b = 0."""
-    r = q[1]
-    th = q[2]
-    if r <= 2.0:
-        r = 2.0 + 1e-8
-    g_tt = -(1.0 - 2.0 / r)
-    g_rr = 1.0 / (1.0 - 2.0 / r)
-    g_thth = r * r
-    g_phph = r * r * math.sin(th) ** 2
-    pr, pth, pph = p_spatial
-    C = g_rr * pr * pr + g_thth * pth * pth + g_phph * pph * pph
-    # Null condition: g_tt (p^t)^2 + C = 0  ->  p^t = ±sqrt(-C/g_tt)
-    pt = math.sqrt(max(0.0, -C / g_tt))
-    return [-pt, pr, pth, pph]  # negative root for consistency with EPy
+
 
 # -----------------------------------------------------------------------------
 #                      FANTASY ORDER-2 SYMPLECTIC INTEGRATOR
@@ -458,7 +443,7 @@ def _metric_contravariant(q, rs, g):
     g[0, 0] = -1.0 / inv_fac
     g[1, 1] = inv_fac
     g[2, 2] = 1.0 / (r * r)
-    sin_th = math.sin(th)
+    sin_th = np.sin(th)
     g[3, 3] = 1.0 / ((r * sin_th) ** 2)
 
 @cuda.jit(device=True)
@@ -480,11 +465,11 @@ def _metric_derivative(q, rs, wrt, gprime):
         # d g^{θθ}/dr = -2 / r^3
         gprime[2, 2] = -2.0 / (r * r * r)
         # d g^{φφ}/dr = -2 /(r^3 sin^2 θ)
-        sin2 = math.sin(th) ** 2
+        sin2 = np.sin(th) ** 2
         gprime[3, 3] = -2.0 / (r * r * r * sin2)
     elif wrt == 2:  # derivative w.r.t θ
-        sin_th = math.sin(th)
-        cos_th = math.cos(th)
+        sin_th = np.sin(th)
+        cos_th = np.cos(th)
         # only g^{φφ} depends on θ
         gprime[3, 3] = (-2.0 * cos_th) / ( (r * r) * sin_th ** 3 )
 
@@ -557,8 +542,8 @@ def _flow_mixed_dev(q1, p1, q2, p2, delta, omega):
     p_dif1 = p1[1] - p2[1]
     p_dif2 = p1[2] - p2[2]
     p_dif3 = p1[3] - p2[3]
-    cos = math.cos(2.0 * omega * delta)
-    sin = math.sin(2.0 * omega * delta)
+    cos = np.cos(2.0 * omega * delta)
+    sin = np.sin(2.0 * omega * delta)
     # q1 next
     q1[0] = 0.5 * (q_sum0 + q_dif0 * cos + p_dif0 * sin)
     q1[1] = 0.5 * (q_sum1 + q_dif1 * cos + p_dif1 * sin)
@@ -607,6 +592,7 @@ def fantasy_integrate_batch_ord2(q0s, p0s, steps, delta, rs, r_max, omega, out_q
         p1[a] = p0s[i, a]
         q2[a] = q0s[i, a]
         p2[a] = p0s[i, a]
+        # tqdm this
     for _ in range(steps):
         # early exit if outside domain
         if q1[1] <= 1.1 * rs or q1[1] >= r_max:

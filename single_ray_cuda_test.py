@@ -260,8 +260,8 @@ def main():
     
     pos_sph = np.array([r0, theta0, phi0]) 
 
-    alpha_deg =  20               # right-hand deflection (towards +y)
-    beta_deg  = 20             # upward deflection   (towards +z)
+    alpha_deg =  0               # right-hand deflection (towards +y)
+    beta_deg  = 90             # upward deflection   (towards +z)
         # ------------------------------------------------------------------
     # 1)  map (α,β) → Cartesian unit vector  (unchanged)
     # ------------------------------------------------------------------

@@ -95,23 +95,7 @@ def plot_scene_topdown(
     plt.close(fig)
     print(f"Saved top-down scene image to {out_path}")
 
-def cartesian_to_spherical_momentum(ray_dir, obs_pos):
-    """
-    Convert a direction vector in Cartesian coordinates to (pr, ptheta, pphi) at the given position.
-    Assumes observer is at (r, theta, phi) in spherical coordinates.
-    """
-    x, y, z = obs_pos
-    r = np.linalg.norm([x, y, z])
-    theta = np.arccos(z / r)
-    phi = np.arctan2(y, x)
-    # Spherical basis vectors at obs_pos
-    e_r = np.array([np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), np.cos(theta)])
-    e_theta = np.array([np.cos(theta)*np.cos(phi), np.cos(theta)*np.sin(phi), -np.sin(theta)])
-    e_phi = np.array([-np.sin(phi), np.cos(phi), 0])
-    pr = np.dot(ray_dir, e_r)
-    ptheta = np.dot(ray_dir, e_theta)
-    pphi = np.dot(ray_dir, e_phi)
-    return pr, ptheta, pphi
+
 
 def plot_scene_embedding_3d(
     bh, observer, image_plane_size, boundary_radius, out_path='images/scene_topdown.png', fov_deg=None, photon_trajectories=None,
@@ -203,29 +187,29 @@ def plot_scene_embedding_3d(
     # 6. Plot user-supplied photon trajectories (orange)
     if photon_trajectories is not None and len(photon_trajectories) > 0:
         for traj in photon_trajectories:
-            if traj.shape[0] < 4:
-                # Densify if only endpoints are provided
-                p0, p1 = traj[0], traj[-1]
-                n_interp = 50
-                alphas = np.linspace(0, 1, n_interp)
-                traj_dense = np.outer(1 - alphas, p0) + np.outer(alphas, p1)
-            else:
-                traj_dense = traj
-            ax.plot(traj_dense[:, 0], traj_dense[:, 1], traj_dense[:, 2], color='orange', lw=3, alpha=1.0, zorder=15, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
+            # if traj.shape[0] < 4:
+            #     # Densify if only endpoints are provided
+            #     p0, p1 = traj[0], traj[-1]
+            #     n_interp = 50
+            #     alphas = np.linspace(0, 1, n_interp)
+            #     traj_dense = np.outer(1 - alphas, p0) + np.outer(alphas, p1)
+            # else:
+            traj_dense = traj
+            ax.plot(traj_dense[:, 0], traj_dense[:, 1], traj_dense[:, 2], color='orange', lw=1, alpha=1.0, zorder=15, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
             # Mark start & end points for clarity
-            ax.scatter(traj_dense[0,0], traj_dense[0,1], traj_dense[0,2], color='lime', s=30, zorder=16)
-            ax.scatter(traj_dense[-1,0], traj_dense[-1,1], traj_dense[-1,2], color='red', s=30, zorder=16)
+            ax.scatter(traj_dense[0,0], traj_dense[0,1], traj_dense[0,2], color='lime', s=20, zorder=16)
+            ax.scatter(traj_dense[-1,0], traj_dense[-1,1], traj_dense[-1,2], color='red', s=20, zorder=16)
     else:
         print("[plot_scene_embedding_3d] Warning: photon_trajectories is None or empty. No sampled rays to plot.")
 
     # 6b. Plot straight-line (no-gravity) photon trajectories (blue)
     if flat_trajectories is not None:
         for traj in flat_trajectories:
-            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='blue', lw=2, alpha=0.7, label='Straight Ray' if 'Straight Ray' not in ax.get_legend_handles_labels()[1] else None)
+            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='blue', lw=1, alpha=0.7, label='Straight Ray' if 'Straight Ray' not in ax.get_legend_handles_labels()[1] else None)
 
     # 7. Plot event horizon last for visibility: solid + wireframe
     ax.plot_surface(x_s, y_s, z_s, color='black', alpha=1.0, zorder=20)
-    ax.plot_wireframe(x_s, y_s, z_s, color='yellow', linewidth=0.7, zorder=21)
+    ax.plot_wireframe(x_s, y_s, z_s, color='yellow', linewidth=0.1, zorder=21)
 
     # Formatting
     ax.set_xlabel('x')
@@ -239,9 +223,6 @@ def plot_scene_embedding_3d(
     legend_elements = [
         Line2D([0], [0], marker='o', color='w', label='Observer', markerfacecolor='red', markersize=10),
         Line2D([0], [0], color='black', lw=4, label='Event Horizon'),
-        Line2D([0], [0], color='yellow', lw=2, label='Event Horizon (Wire)'),
-        Line2D([0], [0], color='blue', lw=2, label='Image Plane'),
-        Line2D([0], [0], color='green', lw=2, label='Boundary'),
         Line2D([0], [0], color='orange', lw=2, label='Sampled Rays'),
         Line2D([0], [0], color='blue', lw=2, label='Straight Rays'),
     ]

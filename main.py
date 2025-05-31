@@ -6,6 +6,7 @@ from simulation.blackhole import BlackHole, Observer
 from simulation.background import save_no_gravity_image_with_background
 from simulation.raytracing import run_manual_simulation
 from visualization.plot import plot_scene_topdown, plot_scene_embedding_3d, plot_scene_closeup_3d
+from simulation.utils import _apply_relative_offsets
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -23,17 +24,27 @@ def main():
     image_size = (args.size, args.size)
     fov_rad = np.radians(args.fov)
     mass_bh = args.bh_mass
-    boundary_radius = args.boundary_radius if args.boundary_radius is not None else 10 * mass_bh
-    observer_x = args.observer_distance if args.observer_distance is not None else 20 * mass_bh
+    boundary_radius = args.boundary_radius
+    observer_x = args.observer_distance
     bh = BlackHole(mass=mass_bh)
     observer_pos = np.array([observer_x, 0, 0])
     observer = Observer(position=observer_pos, fov=fov_rad, image_size=image_size)
+    
+    
+    bg_patch_center_theta_deg = args.bg_patch_center_theta
+    bg_patch_center_phi_deg = args.bg_patch_center_phi
+    
+    bg_patch_center_theta_relobs_deg = args.bg_patch_center_theta_relobs
+    bg_patch_center_phi_relobs_deg = args.bg_patch_center_phi_relobs
+    
+    patch_center_theta_final_rad, patch_center_phi_final_rad = _apply_relative_offsets(bg_patch_center_theta_deg, bg_patch_center_phi_deg, bg_patch_center_theta_relobs_deg, bg_patch_center_phi_relobs_deg)
 
     logging.info("Saving top-down scene view...")
     plot_scene_topdown(
         bh, observer, image_size, boundary_radius=boundary_radius,
         out_path='images/scene_topdown.png', fov_deg=args.fov,
-        patch_center_theta=np.deg2rad(args.bg_patch_center_theta),
+        patch_center_theta=patch_center_theta_final_rad,
+        # patch_center_phi=patch_center_phi_final_rad,
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
         patch_size_phi=np.deg2rad(args.bg_patch_size_phi)
     )
@@ -48,6 +59,8 @@ def main():
         sampled_trajectories = save_no_gravity_image_with_background(
             observer, args.background, 'images/no_gravity.png',
             boundary_radius=boundary_radius,
+            patch_center_theta=patch_center_theta_final_rad,
+            patch_center_phi=patch_center_phi_final_rad,
             patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
             patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
             flip_theta=args.bg_flip_theta,
@@ -78,8 +91,8 @@ def main():
         background_path=args.background,
         use_cuda=args.cuda,
         boundary_radius=boundary_radius,
-        patch_center_theta=np.deg2rad(args.bg_patch_center_theta),
-        patch_center_phi=np.deg2rad(args.bg_patch_center_phi),
+        patch_center_theta=patch_center_theta_final_rad,
+        patch_center_phi=patch_center_phi_final_rad,
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
         patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
         flip_theta=args.bg_flip_theta,
@@ -98,31 +111,46 @@ def main():
     plt.imsave('images/manual_output.png', img)
     logging.info("Saved manual_output.png")
 
-    # Save sampled curved rays if available
-    if photon_trajectories is not None and len(photon_trajectories) > 0:
-        rows = []
-        for ridx, traj in enumerate(photon_trajectories):
-            # Compute angular deviation (degrees) from optical axis (-x direction)
-            if traj.shape[0] >= 2:
-                dvec = traj[1] - traj[0]
-                dvec = dvec / np.linalg.norm(dvec)
-                optical_axis = np.array([-1.0, 0.0, 0.0])
-                cosang = np.clip(np.dot(dvec, optical_axis), -1.0, 1.0)
-                ang_deg = np.degrees(np.arccos(cosang))
-            else:
-                ang_deg = np.nan
-            for pidx, (px, py, pz) in enumerate(traj):
-                rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'angle_deg': ang_deg})
-        pd.DataFrame(rows).to_csv('sampled_rays.csv', index=False)
-        logging.info(f"Saved {len(photon_trajectories)} sampled curved rays to sampled_rays.csv")
+    # already saved in raytracing.py
+    # # Save sampled curved rays if available
+    # if photon_trajectories is not None and len(photon_trajectories) > 0:
+    #     rows = []
+    #     for ridx, traj in enumerate(photon_trajectories):
+    #         # Compute angular deviation (degrees) from optical axis (-x direction)
+    #         if traj.shape[0] >= 2:
+    #             dvec = traj[1] - traj[0]
+    #             dvec = dvec / np.linalg.norm(dvec)
+    #             optical_axis = np.array([-1.0, 0.0, 0.0])
+    #             cosang = np.clip(np.dot(dvec, optical_axis), -1.0, 1.0)
+    #             ang_deg = np.degrees(np.arccos(cosang))
+    #         else:
+    #             ang_deg = np.nan
+    #         for pidx, (px, py, pz) in enumerate(traj):
+    #             rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'angle_deg': ang_deg})
+    #     pd.DataFrame(rows).to_csv('sampled_rays.csv', index=False)
+    #     logging.info(f"Saved {len(photon_trajectories)} sampled curved rays to sampled_rays.csv")
 
     # --- 3D plotting at the very end ---
     logging.info("Saving 3D embedding scene view...")
+    
+    #before plotting photon trajectories, clear all entries that have x,y,z=0
+    if photon_trajectories is not None:
+        # Filter out any trajectory points that are all zeros
+        filtered_trajectories = []
+        for traj in photon_trajectories:
+            filtered_traj = traj[~np.all(traj == 0, axis=1)]
+            if len(filtered_traj) > 0:  # Only keep trajectories that have points remaining
+                filtered_trajectories.append(filtered_traj)
+        photon_trajectories = filtered_trajectories
+        print(f"Filtered {len(photon_trajectories)} trajectories")
+        
     plot_scene_embedding_3d(
         bh, observer, image_size, boundary_radius=boundary_radius,
         out_path='images/scene_topdown_3d.png', fov_deg=args.fov,
         photon_trajectories=photon_trajectories,
         flat_trajectories=flat_trajectories,
+        patch_center_theta=patch_center_theta_final_rad,
+        patch_center_phi=patch_center_phi_final_rad,
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
         patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
         override_patch_center=False
