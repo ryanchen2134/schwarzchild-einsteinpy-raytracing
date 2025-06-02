@@ -10,7 +10,7 @@ from PIL import Image
 import pandas as pd
 from simulation.utils import get_initial_conditions
 import warnings  # CUDA curved geodesic path removed
-from simulation.utils import spherical_to_cartesian_fast
+from simulation.utils import spherical_to_cartesian_fast, cartesian_to_spherical_fast
 
 
 def run_manual_simulation(
@@ -97,39 +97,63 @@ def run_manual_simulation(
         # Prepare initial conditions for all rays
         q0s = np.zeros((h*w, 4), dtype=np.float64)
         p0s = np.zeros((h*w, 4), dtype=np.float64)
-        alpha0s = np.zeros((h*w, 1), dtype=np.float64) # 1 initial alpha per ray
-
+        alpha0s = np.zeros((h*w, ), dtype=np.float64) # 1 initial alpha per ray
+        #ray headings in coordinates relative to origin. (not sphereical basis elements)
+        h_rs = np.zeros((h*w, ), dtype=np.float64)
+        h_thetas = np.zeros((h*w, ), dtype=np.float64)
+        h_phis = np.zeros((h*w, ), dtype=np.float64)
+        # rotaton about the optical axis
+        betas = np.zeros((h*w, ), dtype=np.float64)
+        #
         for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="Calculating Trajectories", unit="ray"):
-            q0, p0, alpha0 = get_initial_conditions(obs_pos, pixel_positions[i, j], mass_bh=bh.mass)
+            q0, p0, alpha0, h_r, h_theta, h_phi, beta = get_initial_conditions(obs_pos, pixel_positions[i, j], mass_bh=bh.mass)
             q0s[idx] = q0
             p0s[idx] = p0
             alpha0s[idx] = alpha0
+            h_rs[idx] = h_r
+            h_thetas[idx] = h_theta
+            h_phis[idx] = h_phi
+            betas[idx] = beta
 
         cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass, r_max=boundary_radius)
         print("Beginning integration (CUDA)...")
         out_qs, _ = cuda_integrator.integrate_batch(q0s, p0s)
         print("Integration complete (CUDA)")
 
-        # Handle sampled trajectories
-        sampled_traj_data = []
-        if n_samples > 0 and len(sampled_indices) > 0:
-            print("Handling sample trajectories (CUDA)...")
-            sample_flat_idx = np.array([i*w + j for (i, j) in sampled_indices], dtype=np.int64)
-            q0s_samples = q0s[sample_flat_idx]
-            p0s_samples = p0s[sample_flat_idx]
-            print("Beginning integration of samples (CUDA)...")
-            traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples)
-            print("Integration of samples complete (CUDA)")
-            # Convert to Cartesian for each sample
-            for s in range(len(sample_flat_idx)):
-                traj_cart = []
-                for step in range(traj_out.shape[1]):
-                    t, r, th, ph = traj_out[s, step]
-                    _,x,y,z  = spherical_to_cartesian_fast(_,r, th, ph)
-                    traj_cart.append([x, y, z])
-                sampled_traj_data.append(np.array(traj_cart))
+            # ── parameters ────────────────────────────────────────────────────────
+    MAX_POINTS = 1000             # cap per ray                ← you can tweak
+
+    # ── Handle sampled trajectories ───────────────────────────────────────
+    sampled_traj_data = []
+    if n_samples > 0 and sampled_indices:
+        print("Handling sample trajectories (CUDA)...")
+        sample_flat_idx = np.array([i*w + j for (i, j) in sampled_indices], dtype=np.int64)
+        q0s_samples = q0s[sample_flat_idx]
+        p0s_samples = p0s[sample_flat_idx]
+
+        print("Beginning integration of samples (CUDA)...")
+        traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples)
+        print("Integration of samples complete (CUDA)")
+
+        # ── down-sample along the integration axis ────────────────────────
+        n_steps_full = traj_out.shape[1]
+        # choose evenly-spaced indices, but never more than MAX_POINTS
+        keep_idx = np.linspace(0, n_steps_full - 1,
+                            num=min(MAX_POINTS, n_steps_full),
+                            dtype=np.int32)
+
+        for s in tqdm(range(len(sample_flat_idx)),
+                    desc="Converting sampled trajectories to Cartesian (CUDA)",
+                    unit="ray"):
+            traj_cart = []
+            for step in keep_idx:
+                t, r, th, ph = traj_out[s, step]
+                _, x, y, z = spherical_to_cartesian_fast(_, r, th, ph)
+                traj_cart.append((x, y, z))
+            sampled_traj_data.append(np.array(traj_cart, dtype=np.float64))
 
 
+        ############################################                                        ##################
         ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours 
         print("Building image from trajectory data(CUDA)...")
         
@@ -151,6 +175,17 @@ def run_manual_simulation(
             r_bh = out_qs[idx, 1]
             th_hit = out_qs[idx, 2]
             ph_hit = out_qs[idx, 3]
+
+            # rotate the hit by the x axis: 
+            x, y, z = spherical_to_cartesian_fast(0, r_bh, th_hit, ph_hit)[1:]
+
+            c, s = np.cos(betas[idx]), np.sin(betas[idx])
+            R_x = np.array([[1, 0, 0],
+                            [0, c, -s],
+                            [0, s, c]])
+            x, y, z = (R_x @ np.array([x, y, z])).tolist()
+            
+            th_hit, ph_hit = cartesian_to_spherical_fast(0, x, y, z)[2:]
 
             # ph_hit = (ph_hit + np.pi) % (2*np.pi) - np.pi
             
@@ -178,19 +213,14 @@ def run_manual_simulation(
                     ph_hit = ph_hit % (2 * np.pi)  # Ensure phi is in [0, 2π]
 
                     dtheta = np.abs(th_hit - patch_center_theta) 
-                    
-                    # #method a
-                    # dphi = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
-                    # inside_patch_angle = (dtheta <= patch_size_theta/2) and (dphi <= patch_size_phi/2)
-                    
-                    #method b
-                    #left side
-                    phi_rel = (ph_hit - phi0)
-                    dphi = np.abs(ph_hit - patch_center_phi)
-                    # phi_rel = (ph_hit - phi0 + np.pi) % (2*np.pi) -np.pi   # 0 … 2π     <—— single line 
-                    # th_hit = (th_hit + np.pi) % (2*np.pi) - np.pi  # -π … π     <—— single line
 
-                    #right side
+                    
+                    # phi_rel = (ph_hit - phi0)
+                    # dphi = np.abs(ph_hit - patch_center_phi)
+
+                    # AFTER   --------------------------------------------------------------
+                    phi_rel = (ph_hit - phi0) % (2*np.pi)          # force into 0 … 2π
+                    dphi     = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
 
                     inside_patch_angle = (dtheta <= patch_size_theta/2) and (dphi <= phi_span/2)
                     
@@ -234,27 +264,34 @@ def run_manual_simulation(
                 # value = (0, 0, 0)
                 collision = 'in_domain'
             img[i, j] = value
-            photon_rows.append({'i': i, 'j': j, 'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit, 'collision': collision})
-
+            
+            photon_rows.append({'i': i, 'j': j, 
+                                'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit,
+                                'collision': collision, 
+                                'h_r': h_rs[idx].item(), 'h_theta': h_thetas[idx].item(), 'h_phi': h_phis[idx].item(),
+                                'p0_r': p0s[idx, 0].item(), 'p0_th': p0s[idx, 1].item(), 'p0_ph': p0s[idx, 2].item()})
+            
+        plt.imsave('images/manual_output.png', img)
+        logging.info("Saved manual_output.png")
+        print("Saving ray photon data...")
         pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False)
 
         # Save sampled trajectories CSV
         if n_samples > 0 and sampled_traj_data:
-            print("Saving sampled trajectories (CUDA)...")
+            print("Saving diagnostic sampled trajectories ...")
             rows = []
-            for ridx, traj in enumerate(sampled_traj_data):
+            #use tqdm to show progress
+            for ridx, traj in tqdm(enumerate(sampled_traj_data), desc="Saving diagnostic sampled trajectories", unit="ray"):
+            # for ridx, traj in enumerate(sampled_traj_data):
                 for pidx, (px, py, pz) in enumerate(traj):
                     pr = np.linalg.norm([px, py, pz])
-                    rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'r': pr})
+                    rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'r': pr, 'h_r': h_rs[ridx], 'h_theta': h_thetas[ridx], 'h_phi': h_phis[ridx]})
             df = pd.DataFrame(rows)
             df.to_csv('sampled_rays.csv', index=False)
 
         sampled_trajectories = sampled_traj_data
     else: ######## CPU fallback (cooked)
         pass
-    # Save the image to disk
-    plt.imsave('images/manual_output.png', img)
-    logging.info("Saved manual_output.png")
 
     # Count summary
     if 'photon_rows' in locals():

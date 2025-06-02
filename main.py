@@ -106,29 +106,12 @@ def main():
         photon_trajectories = None
     plt.imshow(img, origin='lower')
     plt.title('Black Hole Ray Tracing (Manual)')
-    plt.axis('off')
+    # plt.axis('off')
     plt.show()
     plt.imsave('images/manual_output.png', img)
     logging.info("Saved manual_output.png")
 
     # already saved in raytracing.py
-    # # Save sampled curved rays if available
-    # if photon_trajectories is not None and len(photon_trajectories) > 0:
-    #     rows = []
-    #     for ridx, traj in enumerate(photon_trajectories):
-    #         # Compute angular deviation (degrees) from optical axis (-x direction)
-    #         if traj.shape[0] >= 2:
-    #             dvec = traj[1] - traj[0]
-    #             dvec = dvec / np.linalg.norm(dvec)
-    #             optical_axis = np.array([-1.0, 0.0, 0.0])
-    #             cosang = np.clip(np.dot(dvec, optical_axis), -1.0, 1.0)
-    #             ang_deg = np.degrees(np.arccos(cosang))
-    #         else:
-    #             ang_deg = np.nan
-    #         for pidx, (px, py, pz) in enumerate(traj):
-    #             rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'angle_deg': ang_deg})
-    #     pd.DataFrame(rows).to_csv('sampled_rays.csv', index=False)
-    #     logging.info(f"Saved {len(photon_trajectories)} sampled curved rays to sampled_rays.csv")
 
     # --- 3D plotting at the very end ---
     logging.info("Saving 3D embedding scene view...")

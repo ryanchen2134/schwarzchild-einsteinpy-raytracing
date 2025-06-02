@@ -87,55 +87,110 @@ def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
 
     return np.array([p_t, pr, pth, pph])
 
+# utils.py  --------------------------------------------------------------
 def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
-    """Return (`q0`, `p0`, 'alpha) for a photon launched from *observer_pos* towards
-    *pixel_pos*.
-
-    • `q0` is the 4-position `(t=0, r, θ, φ)` in Schwarzschild coordinates.
-    • `p0` is the **full** contravariant null 4-momentum `(p^t, p^r, …)` that
-      satisfies `g_{μν} p^μ p^ν = 0`.
-    • `alpha` is the angle between the ray and the optical axis (in radians) in flat geometry
-        (useful later for mapping the ray to the background image and determining BH-bound rays)
-
-    The routine follows the derivation showcased in *single_ray_cuda_test.py*
-    for robustness and mass-dependency, superseding previous uses of
-    `cartesian_to_spherical_fast`.
+    """
+    Returns q0, p0, alpha, beta  (beta = rotation about +x̂).
     """
 
-    # 1) direction (unit) vector in Cartesian coords -------------------------
+    # ------------------------------------------------------------------ #
+    # 0)  Build the raw ray direction in the *lab* frame
+    # ------------------------------------------------------------------ #
     ray_dir = pixel_pos - observer_pos
-    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+    ray_dir /= np.linalg.norm(ray_dir)
 
-    # 2) observer position in spherical coords ------------------------------
-    x, y, z = observer_pos
-    _, r, theta, phi = cartesian_to_spherical_fast(0,x, y, z)
-    r_obs = r
+    # β = angle between ray_dir and the x-y plane.  Positive if ray has +z.
+    beta = np.arctan2(ray_dir[2], ray_dir[1])
+    # Rotate by −β about +x̂ so the vector lies in x-y plane
+    c, s = np.cos(-beta), np.sin(-beta)
+    R_x = np.array([[1, 0, 0],
+                    [0, c,-s],
+                    [0, s, c]])
+    ray_xy = R_x @ ray_dir
+    # ray_xy = np.matmul(R_x, ray_dir)
+    # print(ray_xy)
     
-    # 2.1) ray direction in spherical coords ------------------------------
-    x, y, z = ray_dir
-    _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, x, y, z)
+    assert abs(ray_xy[2]) < 1e-6     ,print(f"original ray: {ray_dir}, ray_xy: {ray_xy}, beta: {beta}")    # z ≈ 0 by construction
+
+    # ------------------------------------------------------------------ #
+    # 1)  Observer position in spherical → needed for q0
+    # ------------------------------------------------------------------ #
+    r_obs, theta_obs, phi_obs = cartesian_to_spherical_fast(0,*observer_pos)[1:]
+
+    # ------------------------------------------------------------------ #
+    # 2)  Direction vector in *rotated* frame ⇒ camera angles α (=φ_xy)
+    # ------------------------------------------------------------------ #
+    
+    h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, *ray_xy)[1:]
+    
+    assert abs(h_theta - np.pi/2) < 1e-6, print(f"h_spherical: {h_r,h_theta, h_phi}")
+    
+    #  p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
+    p_spatial = angles_to_p_sph(np.pi - h_phi, 0.0, r_obs, normalise=True)
+
+    # ------------------------------------------------------------------ #
+    # 3)  Full null 4-momentum and initial 4-position
+    # ------------------------------------------------------------------ #
+    p0 = build_null_4momentum_ep_sph(p_spatial,
+                                     np.array([r_obs, theta_obs, phi_obs]),
+                                     mass_bh=mass_bh, future=False)
+    q0 = np.array([0.0, r_obs, theta_obs, phi_obs])
+
+    _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, *ray_dir)
+    alpha0 = np.arccos(-p_spatial[0]* r_obs)  # renormalize to flat geometry
+    return q0, p0, alpha0, h_r, h_theta, h_phi, beta
+
+
+
+# def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
+#     """Return (`q0`, `p0`, 'alpha) for a photon launched from *observer_pos* towards
+#     *pixel_pos*.
+
+#     • `q0` is the 4-position `(t=0, r, θ, φ)` in Schwarzschild coordinates.
+#     • `p0` is the **full** contravariant null 4-momentum `(p^t, p^r, …)` that
+#       satisfies `g_{μν} p^μ p^ν = 0`.
+#     • `alpha` is the angle between the ray and the optical axis (in radians) in flat geometry
+#         (useful later for mapping the ray to the background image and determining BH-bound rays)
+
+#     The routine follows the derivation showcased in *single_ray_cuda_test.py*
+#     for robustness and mass-dependency, superseding previous uses of
+#     `cartesian_to_spherical_fast`.
+#     """
+
+#     # 1) direction (unit) vector in Cartesian coords -------------------------
+#     ray_dir = pixel_pos - observer_pos
+#     ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+#     # 2) observer position in spherical coords ------------------------------
+#     x, y, z = observer_pos
+#     _, r, theta, phi = cartesian_to_spherical_fast(0,x, y, z)
+#     r_obs = r
+    
+#     # 2.1) ray direction in spherical coords ------------------------------
+#     x, y, z = ray_dir
+#     _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, x, y, z)
     
     
-    # 3) convert direction vector to spherical momentum coordinate components of the 
-    # rhat, phi hat, theta hat basis vectors, normalized
+#     # 3) convert direction vector to spherical momentum coordinate components of the 
+#     # rhat, phi hat, theta hat basis vectors, normalized
     
-    p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
+#     p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
     
-    p_r = p_spatial[0] * r_obs # needs to be renormalized since the component was streched due to 
-                                    # geometrised units
-    alpha = np.arccos(-p_r) # the dot product of the momentum and the optical axis
+#     p_r = p_spatial[0] * r_obs # needs to be renormalized since the component was streched due to 
+#                                     # geometrised units
+#     alpha = np.arccos(-p_r) # the dot product of the momentum and the optical axis
 
    
-    # 5) full 4-momentum via null condition ---------------------------------
+#     # 5) full 4-momentum via null condition ---------------------------------
     
     
     
-    p0 = build_null_4momentum_ep_sph(p_spatial, np.array([r, theta, phi]), mass_bh=mass_bh, future=False)
+#     p0 = build_null_4momentum_ep_sph(p_spatial, np.array([r, theta, phi]), mass_bh=mass_bh, future=False)
 
-    # 6) final 4-position ----------------------------------------------------
-    q0 = np.array([0.0, r, theta, phi])
+#     # 6) final 4-position ----------------------------------------------------
+#     q0 = np.array([0.0, r, theta, phi])
 
-    return q0, p0, alpha
+#     return q0, p0, alpha, h_r, h_theta, h_phi
 
 # -----------------------------------------------------------------------------
 # Helper: angles (α,β) → spherical momentum components

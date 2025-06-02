@@ -249,13 +249,13 @@ def main():
     # ---------------- parameters -----------------
     mass_bh = 1.0
     
-    r_max =1000
-    steps, delta, omega = 100_000 , 10e-3, 0.001 # delta is the affine step size
+    r_max =50
+    steps, delta, omega = 200_000 , 0.03, 0.01 # delta is the affine step size
 
     theta0, phi0 = np.pi/2, 0.0
     
     #R_obs = 500   # same as r0
-    R_obs = 10
+    R_obs = 35
     r0    = R_obs                   # keep a single source of truth
     
     pos_sph = np.array([r0, theta0, phi0]) 
@@ -275,7 +275,7 @@ def main():
     
     
     # p_direction = np.array([1/10,1,1])  # (p^r, p^θ, p^φ)
-    
+    p_direction = np.array([-0.026942690335328513,-0.028502831807219468,0.06898831276132347])
     
     
 
@@ -303,6 +303,7 @@ def main():
     #get traj datapoints
     length = len(traj)
     print(f"Trajectory length: {length} steps")
+    
     safe = traj[:, 1] > 1.1 * rs
     if not np.all(safe):
         traj = traj[: np.argmax(~safe)]
