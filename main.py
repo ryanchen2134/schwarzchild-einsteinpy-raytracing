@@ -38,21 +38,8 @@ def main():
     bg_patch_center_phi_relobs_deg = args.bg_patch_center_phi_relobs
     
     patch_center_theta_final_rad, patch_center_phi_final_rad = _apply_relative_offsets(bg_patch_center_theta_deg, bg_patch_center_phi_deg, bg_patch_center_theta_relobs_deg, bg_patch_center_phi_relobs_deg)
-
-    logging.info("Saving top-down scene view...")
-    plot_scene_topdown(
-        bh, observer, image_size, boundary_radius=boundary_radius,
-        out_path='images/scene_topdown.png', fov_deg=args.fov,
-        patch_center_theta=patch_center_theta_final_rad,
-        # patch_center_phi=patch_center_phi_final_rad,
-        patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
-        patch_size_phi=np.deg2rad(args.bg_patch_size_phi)
-    )
     
-    logging.info("Saving close-up 3D scene view...")
-    plot_scene_closeup_3d(
-        bh, observer, image_size, out_path='images/scene_closeup_3d.png', fov_deg=args.fov
-    )
+    
     
     logging.info("Saving no-gravity image using background...")
     if not args.no_flat_trajectories:
@@ -127,6 +114,21 @@ def main():
         photon_trajectories = filtered_trajectories
         print(f"Filtered {len(photon_trajectories)} trajectories")
         
+    logging.info("Saving top-down scene view...")
+    plot_scene_topdown(
+        bh, observer, image_size, boundary_radius=boundary_radius,
+        out_path='images/scene_topdown.png', fov_deg=args.fov,
+        patch_center_theta=patch_center_theta_final_rad,
+        # patch_center_phi=patch_center_phi_final_rad,
+        patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
+        patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
+        photon_trajectories=photon_trajectories
+    )
+        
+    logging.info("Saving close-up 3D scene view...")
+    plot_scene_closeup_3d(
+        bh, observer, image_size, out_path='images/scene_closeup_3d.png', fov_deg=args.fov, photon_trajectories=photon_trajectories
+    )
     plot_scene_embedding_3d(
         bh, observer, image_size, boundary_radius=boundary_radius,
         out_path='images/scene_topdown_3d.png', fov_deg=args.fov,

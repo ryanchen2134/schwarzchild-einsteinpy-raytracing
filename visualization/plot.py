@@ -15,7 +15,7 @@ def plot_placeholder():
 
 def plot_scene_topdown(
     bh, observer, image_plane_size, boundary_radius, out_path='images/scene_topdown.png', fov_deg=50,
-    patch_center_theta=np.pi/2, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10)
+    patch_center_theta=np.pi/2, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10), photon_trajectories=None
 ):
     """
     Plot a top-down (x-y) view of the simulation setup, matching the actual raytracing geometry:
@@ -49,11 +49,7 @@ def plot_scene_topdown(
             [obs_y, obs_y + 2 * boundary_radius * np.sin(theta0)], 'k--', lw=1, alpha=0.7)
     ax.plot([obs_x, obs_x + 2 * boundary_radius * np.cos(theta1)],
             [obs_y, obs_y + 2 * boundary_radius * np.sin(theta1)], 'k--', lw=1, alpha=0.7)
-    # Draw FOV arc on boundary (for reference)
-    arc_thetas = np.linspace(theta0, theta1, 200)
-    arc_x = boundary_radius * np.cos(arc_thetas)
-    arc_y = boundary_radius * np.sin(arc_thetas)
-    ax.plot(arc_x, arc_y, color='green', lw=2, alpha=0.3, label='FOV (Boundary Arc)')
+
     # Draw background patch as an arc/segment on the boundary
     # Patch is centered on the point opposite the observer
     obs_phi = np.arctan2(obs_y, obs_x)
@@ -74,9 +70,17 @@ def plot_scene_topdown(
     for px, py in zip(plane_x, plane_y):
         ax.plot([obs_x, px], [obs_y, py], color='blue', lw=0.5, alpha=0.2)
     # Overlay photon emission directions as rays (sparser for clarity)
-    for t in np.linspace(theta0, theta1, min(n_pix, 32)):
-        ax.plot([obs_x, obs_x + boundary_radius * np.cos(t)],
-                [obs_y, obs_y + boundary_radius * np.sin(t)], color='orange', lw=0.5, alpha=0.3)
+    #draw the trajectories provided by photon_trajectories
+    if photon_trajectories is not None:
+        #make sure trajectories have max 100 (evenly spaced) points per trajectory
+        for traj in photon_trajectories:
+            n_points = traj.shape[0]
+            if n_points > 100:
+                traj = traj[::n_points//100]    
+            ax.plot(traj[:,0], traj[:,1], color='orange', lw=0.5, alpha=0.3, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
+            # Mark start & end points for clarity
+            ax.scatter(traj[0,0], traj[0,1], color='lime', s=20, zorder=16)
+            ax.scatter(traj[-1,0], traj[-1,1], color='red', s=20, zorder=16)
     # Formatting
     ax.set_aspect('equal')
     ax.set_xlabel('x')
@@ -182,7 +186,7 @@ def plot_scene_embedding_3d(
     patch_x = br * np.sin(patch_theta_grid) * np.cos(patch_phi_grid)
     patch_y = br * np.sin(patch_theta_grid) * np.sin(patch_phi_grid)
     patch_z = br * np.cos(patch_theta_grid)
-    ax.plot_surface(patch_x, patch_y, patch_z, color='magenta', alpha=0.5, linewidth=0, antialiased=True, zorder=10)
+    ax.plot_surface(patch_x, patch_y, patch_z, color='magenta', alpha=0.2, linewidth=0, antialiased=True, zorder=10)
 
     # 6. Plot user-supplied photon trajectories (orange)
     if photon_trajectories is not None and len(photon_trajectories) > 0:
@@ -231,16 +235,16 @@ def plot_scene_embedding_3d(
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.tight_layout()
 
-    # --- Output 3 perspectives rotated about z axis ---
+    # --- Output many perspectives rotated about z axis ---
     base, ext = os.path.splitext(out_path)
-    for i, azim in enumerate([0,90,120, 180 ,240]):
+    for i, azim in enumerate([0,45,90,135, 180 ,225, 270, 315]):
         ax.view_init(elev=30, azim=azim)  # 30 deg elevation, azim rotation
         out_path_rot = f"{base}_azim{azim}{ext}"
         fig.savefig(out_path_rot)
         print(f"Saved 3D embedding scene image to {out_path_rot}")
     plt.close(fig) 
 
-def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene_closeup_3d.png', fov_deg=None):
+def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene_closeup_3d.png', fov_deg=None, photon_trajectories=None):
     """
     Plot a close-up 3D view near the observer, showing:
     - Observer (point)
@@ -267,13 +271,14 @@ def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene
     up_vec = up_vec / np.linalg.norm(up_vec)
     width = 2 * plane_dist * np.tan(fov/2)
     height = width * (h/w)
+    
     # Rectangle corners
     corners = []
     for dx, dy in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5)]:
         corner = plane_center + dx*width*right + dy*height*up_vec
         corners.append(corner)
     corners = np.array(corners)
-    # Event horizon
+    # Event horizon # R = 2M for M=1
     u_sphere, v_sphere = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
     x_s = rs * np.cos(u_sphere) * np.sin(v_sphere)
     y_s = rs * np.sin(u_sphere) * np.sin(v_sphere)
@@ -286,21 +291,29 @@ def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene
     ax.plot_wireframe(x_s, y_s, z_s, color='yellow', linewidth=0.7, zorder=21)
     # Observer
     ax.scatter([obs_pos[0]], [obs_pos[1]], [obs_pos[2]], color='red', s=100, label='Observer')
+    
+    #draw the trajectories provided by photon_trajectories
+    if photon_trajectories is not None:
+        #make sure trajectories have max 100 (evenly spaced) points per trajectory
+        for traj in photon_trajectories:
+            n_points = traj.shape[0]
+            if n_points > 100:
+                traj = traj[::n_points//100]
+            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='orange', lw=1, alpha=1.0, zorder=15, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
+            # Mark start & end points for clarity
+            ax.scatter(traj[0,0], traj[0,1], traj[0,2], color='lime', s=20, zorder=16)
+            ax.scatter(traj[-1,0], traj[-1,1], traj[-1,2], color='red', s=20, zorder=16)
+        for traj in photon_trajectories:
+            ax.plot(traj[:,0], traj[:,1], traj[:,2], color='orange', lw=1, alpha=1.0, zorder=15, label='Sampled Rays' if 'Sampled Rays' not in ax.get_legend_handles_labels()[1] else None)
+            # Mark start & end points for clarity
+            ax.scatter(traj[0,0], traj[0,1], traj[0,2], color='lime', s=20, zorder=16)
+            ax.scatter(traj[-1,0], traj[-1,1], traj[-1,2], color='red', s=20, zorder=16)
+            
     # Image plane (rectangle)
     ax.plot(corners[:,0], corners[:,1], corners[:,2], color='blue', lw=2, label='Image Plane')
-    # FOV arc (dashed) on the image plane
-    n_arc = 100
-    arc_angles = np.linspace(-fov/2, fov/2, n_arc)
-    # The image plane normal is -obs_pos/obs_r
-    # The arc is drawn on the image plane, centered at the observer, at distance plane_dist
-    arc_points = []
-    for angle in arc_angles:
-        # Rotate right vector by angle in the image plane
-        vec = np.cos(angle) * right + np.sin(angle) * up_vec
-        arc_pt = obs_pos + plane_dist * (-obs_pos/obs_r) + (width/2) * vec
-        arc_points.append(arc_pt)
-    arc_points = np.array(arc_points)
-    ax.plot(arc_points[:,0], arc_points[:,1], arc_points[:,2], color='purple', ls='--', lw=2, label='FOV Arc')
+    
+
+
     # Set axis limits to include observer, image plane, and black hole (origin), with margin
     all_points = np.vstack([
         corners,

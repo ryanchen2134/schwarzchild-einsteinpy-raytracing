@@ -61,7 +61,7 @@ def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
     """
 
     pr, pth, pph = p_sph
-    r, th, _ = pos_sph
+    r, th, _ = pos_sph 
 
     f = 1.0 - 2.0 * mass_bh / r
     if f <= 0.0:
@@ -126,77 +126,26 @@ def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
     assert abs(h_theta - np.pi/2) < 1e-6, print(f"h_spherical: {h_r,h_theta, h_phi}")
     
     #  p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
-    p_spatial = angles_to_p_sph(np.pi - h_phi, 0.0, r_obs, normalise=True)
+    p_spatial = angles_to_p_sph(np.pi - h_phi, 0.0, r_obs, mass_bh=mass_bh, normalise=True)
 
     # ------------------------------------------------------------------ #
     # 3)  Full null 4-momentum and initial 4-position
     # ------------------------------------------------------------------ #
     p0 = build_null_4momentum_ep_sph(p_spatial,
                                      np.array([r_obs, theta_obs, phi_obs]),
-                                     mass_bh=mass_bh, future=False)
+                                     mass_bh=mass_bh, future=True)
     q0 = np.array([0.0, r_obs, theta_obs, phi_obs])
 
     _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, *ray_dir)
-    alpha0 = np.arccos(-p_spatial[0]* r_obs)  # renormalize to flat geometry
+    alpha0 = np.arccos(-p_spatial[0] / np.sqrt(1.0 - 2.0 * mass_bh / r_obs))  # renormalize to flat geometry
     return q0, p0, alpha0, h_r, h_theta, h_phi, beta
 
-
-
-# def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
-#     """Return (`q0`, `p0`, 'alpha) for a photon launched from *observer_pos* towards
-#     *pixel_pos*.
-
-#     • `q0` is the 4-position `(t=0, r, θ, φ)` in Schwarzschild coordinates.
-#     • `p0` is the **full** contravariant null 4-momentum `(p^t, p^r, …)` that
-#       satisfies `g_{μν} p^μ p^ν = 0`.
-#     • `alpha` is the angle between the ray and the optical axis (in radians) in flat geometry
-#         (useful later for mapping the ray to the background image and determining BH-bound rays)
-
-#     The routine follows the derivation showcased in *single_ray_cuda_test.py*
-#     for robustness and mass-dependency, superseding previous uses of
-#     `cartesian_to_spherical_fast`.
-#     """
-
-#     # 1) direction (unit) vector in Cartesian coords -------------------------
-#     ray_dir = pixel_pos - observer_pos
-#     ray_dir = ray_dir / np.linalg.norm(ray_dir)
-
-#     # 2) observer position in spherical coords ------------------------------
-#     x, y, z = observer_pos
-#     _, r, theta, phi = cartesian_to_spherical_fast(0,x, y, z)
-#     r_obs = r
-    
-#     # 2.1) ray direction in spherical coords ------------------------------
-#     x, y, z = ray_dir
-#     _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, x, y, z)
-    
-    
-#     # 3) convert direction vector to spherical momentum coordinate components of the 
-#     # rhat, phi hat, theta hat basis vectors, normalized
-    
-#     p_spatial = angles_to_p_sph(np.pi-h_phi, np.pi/2-h_theta, r_obs)
-    
-#     p_r = p_spatial[0] * r_obs # needs to be renormalized since the component was streched due to 
-#                                     # geometrised units
-#     alpha = np.arccos(-p_r) # the dot product of the momentum and the optical axis
-
-   
-#     # 5) full 4-momentum via null condition ---------------------------------
-    
-    
-    
-#     p0 = build_null_4momentum_ep_sph(p_spatial, np.array([r, theta, phi]), mass_bh=mass_bh, future=False)
-
-#     # 6) final 4-position ----------------------------------------------------
-#     q0 = np.array([0.0, r, theta, phi])
-
-#     return q0, p0, alpha, h_r, h_theta, h_phi
 
 # -----------------------------------------------------------------------------
 # Helper: angles (α,β) → spherical momentum components
 # -----------------------------------------------------------------------------
 
-def angles_to_p_sph(alpha, beta, r_obs, *, normalise=True):
+def angles_to_p_sph(alpha, beta, r_obs, *, mass_bh=1.0, normalise=True):
     """Return coordinate-basis momentum components `(p^r, p^θ, p^φ)` for a ray
     emitted from the observer on the **+x axis** (θ = π/2, φ = 0) that makes
     camera angles *(alpha, beta)*:
@@ -222,14 +171,25 @@ def angles_to_p_sph(alpha, beta, r_obs, *, normalise=True):
     n_phhat =  math.sin(alpha) * math.cos(beta)   # +y
     n_thhat = -math.sin(beta)                     # –z (θ̂)
 
+
+
+
     # 2) optional normalisation
     if normalise:
-        norm = np.linalg.norm(np.array([n_rhat, n_thhat, n_phhat]))
-        n_rhat, n_thhat, n_phhat = n_rhat/norm, n_thhat/norm, n_phhat/norm
+        f_r   = np.sqrt(1.0 - 2.0 * mass_bh / r_obs)      # √g_rr  (with G=c=1)
+        f_ang = r_obs                               # r
+        # at θ = π/2, r sinθ = r
 
-    # 3) convert orthonormal → coordinate basis components
-    p_r  = n_rhat / r_obs            # radial component (already correct units)
-    p_th = n_thhat    # divide by r
-    p_ph = n_phhat  # divide by r
+        p_r  = n_rhat  * f_r       # divide by √g_rr
+        p_th = n_thhat * f_ang     # divide by r
+        p_ph = n_phhat * f_ang     # divide by r (equator)
+       
+        # p_r = n_rhat / r_obs
+        # p_th = n_thhat
+        # p_ph = n_phhat
+
+
+
+
 
     return np.array([p_r, p_th, p_ph]) 

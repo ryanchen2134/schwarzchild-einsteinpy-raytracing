@@ -82,7 +82,7 @@ def run_manual_simulation(
     pixel_positions = np.zeros((h, w, 3))
     for i in range(h):
         for j in range(w):
-            u = (j + 0.5) / w - 0.5
+            u = (j + 0.5) / w - 0.5 # first term is a normalized quantity, second term (-0.5) moves to the left/top
             v = (i + 0.5) / h - 0.5
             pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
             pixel_positions[i, j] = pixel_pos
@@ -142,13 +142,19 @@ def run_manual_simulation(
                             num=min(MAX_POINTS, n_steps_full),
                             dtype=np.int32)
 
-        for s in tqdm(range(len(sample_flat_idx)),
+        for sample_idx in tqdm(range(len(sample_flat_idx)),
                     desc="Converting sampled trajectories to Cartesian (CUDA)",
                     unit="ray"):
             traj_cart = []
             for step in keep_idx:
-                t, r, th, ph = traj_out[s, step]
+                t, r, th, ph = traj_out[sample_idx, step]
                 _, x, y, z = spherical_to_cartesian_fast(_, r, th, ph)
+                #rotate back by beta
+                cos, sin = np.cos(betas[sample_flat_idx[sample_idx]]), np.sin(betas[sample_flat_idx[sample_idx]]) #this is the rotation about the optical axis
+                R_x = np.array([[1, 0, 0],
+                                [0, cos, -sin],
+                                [0, sin, cos]])
+                x, y, z = (R_x @ np.array([x, y, z])).tolist()
                 traj_cart.append((x, y, z))
             sampled_traj_data.append(np.array(traj_cart, dtype=np.float64))
 
@@ -196,7 +202,8 @@ def run_manual_simulation(
             
             # bh_angle = np.arctan(bh.rs/2/obs_pos[0]) #this is the disk radius
             #the shadow radius is related to the impact parameter for plunge photons
-            b_crit = 3 * np.sqrt(3) * bh.rs
+            b_crit = 3 * np.sqrt(3) * bh.rs 
+
             bh_angle = np.arcsin(b_crit/obs_pos[0])/2
             
             
@@ -217,7 +224,7 @@ def run_manual_simulation(
                     
                     # phi_rel = (ph_hit - phi0)
                     # dphi = np.abs(ph_hit - patch_center_phi)
-
+                    ph_hit   = (-ph_hit)        if flip_phi  else ph_hit
                     # AFTER   --------------------------------------------------------------
                     phi_rel = (ph_hit - phi0) % (2*np.pi)          # force into 0 … 2π
                     dphi     = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
@@ -226,7 +233,7 @@ def run_manual_simulation(
                     
                     if inside_patch_angle:
                         theta_map = (np.pi - th_hit) if flip_theta else th_hit
-                        phi_map   = (-ph_hit)        if flip_phi  else ph_hit
+                        
 
                         
                         #method b:
@@ -248,20 +255,20 @@ def run_manual_simulation(
                         # u = np.clip(u, 0, h-1)
                         # v = np.clip(v, 0, w-1)
                         # value = tuple(bg_array[u, v])
-                        bg_u, bg_v = u, v
-                        rgb = value
+                        # bg_u, bg_v = u, v
+                        # rgb = value
                         collision = 'escape_bg'
                     else:
-                        value = (0, 0, 255)
+                        value = (0, 0, 0) #(0, 0, 255)
                         # value = (0, 0, 0)
                         collision = 'escape_no_patch'
                 else:
-                    value = (0, 0, 255)
+                    value = (0, 0, 0) #(0, 0, 255)
                     # value = (0, 0, 0)
                     collision = 'escape_no_patch'
             else:
-                value = (255, 0, 0)
-                # value = (0, 0, 0)
+                # value = (255, 0, 0)
+                value = (0, 0, 0)
                 collision = 'in_domain'
             img[i, j] = value
             
@@ -269,7 +276,8 @@ def run_manual_simulation(
                                 'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit,
                                 'collision': collision, 
                                 'h_r': h_rs[idx].item(), 'h_theta': h_thetas[idx].item(), 'h_phi': h_phis[idx].item(),
-                                'p0_r': p0s[idx, 0].item(), 'p0_th': p0s[idx, 1].item(), 'p0_ph': p0s[idx, 2].item()})
+                                'p0_t': p0s[idx, 0].item(), 'p0_r': p0s[idx, 1].item(), 'p0_th': p0s[idx, 2].item(), 'p0_ph': p0s[idx, 3].item(),
+                                'alpha0': alpha0s[idx].item()})
             
         plt.imsave('images/manual_output.png', img)
         logging.info("Saved manual_output.png")
