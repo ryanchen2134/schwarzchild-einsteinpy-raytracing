@@ -1,7 +1,7 @@
 # Schwarzschild Ray Tracer
 
 **Simulating gravitational lensing and photon trajectories in Schwarzschild spacetime using inverse ray tracing and general relativity.**
-
+Read the implementation details [here!](Phys_129L_Final_Project_Report-3.pdf) 
 ![Ray Tracing Example](images/manual_output.png)
 
 ## 📜 Overview
