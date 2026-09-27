@@ -393,34 +393,6 @@ def _integrate_batch_full(q0s, p0s, steps, delta, rs, out_qs_traj):
             q[a] += delta * dqdt[a]
             p[a] += delta * dpdt[a]
 
-# ------------------------- Public wrapper class -----------------------------
-class CUDASchwarzschildIntegrator:
-    """Simple fixed-step GPU integrator for null geodesics in Schwarzschild
-    spacetime (G=c=M=1)."""
-
-    def __init__(self, steps=500, delta=0.2, mass=1.0):
-        self.steps = steps
-        self.delta = delta
-        self.rs = 2.0 * mass
-
-    def integrate_batch(self, q0s, p0s):
-        n = q0s.shape[0]
-        out_qs = np.zeros_like(q0s)
-        out_ps = np.zeros_like(p0s)
-        threads = 32
-        blocks = (n + (threads - 1)) // threads
-        _integrate_batch[blocks, threads](q0s, p0s, self.steps, self.delta, self.rs, out_qs, out_ps)
-        return out_qs, out_ps
-
-    def integrate_batch_full(self, q0s, p0s):
-        n = q0s.shape[0]
-        out_qs_traj = np.zeros((n, self.steps, 4), dtype=np.float64)
-        threads = 32
-        blocks = (n + (threads - 1)) // threads
-        _integrate_batch_full[blocks, threads](q0s, p0s, self.steps, self.delta, self.rs, out_qs_traj)
-        return out_qs_traj
-
-
 
 # -----------------------------------------------------------------------------
 #                      FANTASY ORDER-2 SYMPLECTIC INTEGRATOR

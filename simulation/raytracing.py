@@ -15,7 +15,7 @@ from simulation.utils import spherical_to_cartesian_fast, cartesian_to_spherical
 
 def run_manual_simulation(
     bh, observer, real_time=False, update_every=32,
-    steps=500, delta=0.2, omega=1.0, rtol=1e-2, atol=1e-2, order=2, suppress_warnings=False,
+    steps=500, delta=0.2, omega=1.0, suppress_warnings=False,
     background_path=None, use_cuda=False,
     boundary_radius=None,
     patch_center_theta=np.pi/2, patch_center_phi=np.pi, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
@@ -90,6 +90,9 @@ def run_manual_simulation(
     # if boundary_radius is None:
     #     boundary_radius = 10 * bh.rs
 
+    if not use_cuda:
+        raise NotImplementedError("No CPU geodesic integrator exists; run with CUDA enabled.")
+
     if use_cuda:
         logging.info("Using CUDA Schwarzschild integrator for curved rays ...")
         from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
@@ -115,7 +118,7 @@ def run_manual_simulation(
             h_phis[idx] = h_phi
             betas[idx] = beta
 
-        cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass, r_max=boundary_radius)
+        cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass, omega=omega, r_max=boundary_radius)
         print("Beginning integration (CUDA)...")
         out_qs, _ = cuda_integrator.integrate_batch(q0s, p0s)
         print("Integration complete (CUDA)")
@@ -159,147 +162,143 @@ def run_manual_simulation(
             sampled_traj_data.append(np.array(traj_cart, dtype=np.float64))
 
 
-        ############################################                                        ##################
-        ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours 
-        print("Building image from trajectory data(CUDA)...")
+    ############################################                                        ##################
+    ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours ## Build image colours 
+    print("Building image from trajectory data(CUDA)...")
+    
+    theta0 = patch_center_theta - patch_size_theta/2
+    theta1 = patch_center_theta + patch_size_theta/2
+    phi0   = patch_center_phi   - patch_size_phi/2
+    # phi1   = patch_center_phi   + patch_size_phi/2
+    
+    # method a:
+    # phi_span = (phi1 - phi0) % (2*np.pi) or 2*np.pi  # handle 2π wrap
+    #method b:
+    phi_span = patch_size_phi               # = ϕ₁ – ϕ₀ (no modulo!)
+
+    
+
+    photon_rows = []
+    for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="Mapping rays to images (CUDA)", unit="ray"):
         
-        theta0 = patch_center_theta - patch_size_theta/2
-        theta1 = patch_center_theta + patch_size_theta/2
-        phi0   = patch_center_phi   - patch_size_phi/2
-        # phi1   = patch_center_phi   + patch_size_phi/2
+        r_bh = out_qs[idx, 1]
+        th_hit = out_qs[idx, 2]
+        ph_hit = out_qs[idx, 3]
+
+        # rotate the hit by the x axis: 
+        x, y, z = spherical_to_cartesian_fast(0, r_bh, th_hit, ph_hit)[1:]
+
+        c, s = np.cos(betas[idx]), np.sin(betas[idx])
+        R_x = np.array([[1, 0, 0],
+                        [0, c, -s],
+                        [0, s, c]])
+        x, y, z = (R_x @ np.array([x, y, z])).tolist()
         
-        # method a:
-        # phi_span = (phi1 - phi0) % (2*np.pi) or 2*np.pi  # handle 2π wrap
-        #method b:
-        phi_span = patch_size_phi               # = ϕ₁ – ϕ₀ (no modulo!)
+        th_hit, ph_hit = cartesian_to_spherical_fast(0, x, y, z)[2:]
 
+        # ph_hit = (ph_hit + np.pi) % (2*np.pi) - np.pi
         
+        collision = ''
+        # Analytic shadow edge for a static observer at r_obs:
+        #   sin(alpha_crit) = (b_crit / r_obs) * sqrt(1 - 2M/r_obs),  b_crit = 3*sqrt(3)*M
+        # Recorded as a diagnostic only; capture is decided by the integrator
+        # (the kernel stops at r <= 1.1 r_s).
+        b_crit = 3 * np.sqrt(3) * bh.mass
+        r_obs = np.linalg.norm(obs_pos)
+        bh_angle = np.arcsin(b_crit / r_obs * np.sqrt(1.0 - 2.0 * bh.mass / r_obs))
+        analytic_capture = bool(alpha0s[idx] <= bh_angle)
 
-        photon_rows = []
-        for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="Mapping rays to images (CUDA)", unit="ray"):
-            
-            r_bh = out_qs[idx, 1]
-            th_hit = out_qs[idx, 2]
-            ph_hit = out_qs[idx, 3]
+        if r_bh <= bh.rs*1.2:
+            value = (0, 0, 0)
+            collision = 'bh'
+        elif (r_bh >= 100):
+            value = (255, 0, 0)
+            collision = 'numerical error'
+        elif r_bh >= boundary_radius:
+            if bg_array is not None:
+                
+                th_hit = th_hit % (2 * np.pi)  # Ensure theta is in [0, 2π]
+                ph_hit = ph_hit % (2 * np.pi)  # Ensure phi is in [0, 2π]
 
-            # rotate the hit by the x axis: 
-            x, y, z = spherical_to_cartesian_fast(0, r_bh, th_hit, ph_hit)[1:]
+                dtheta = np.abs(th_hit - patch_center_theta) 
 
-            c, s = np.cos(betas[idx]), np.sin(betas[idx])
-            R_x = np.array([[1, 0, 0],
-                            [0, c, -s],
-                            [0, s, c]])
-            x, y, z = (R_x @ np.array([x, y, z])).tolist()
-            
-            th_hit, ph_hit = cartesian_to_spherical_fast(0, x, y, z)[2:]
+                
+                # phi_rel = (ph_hit - phi0)
+                # dphi = np.abs(ph_hit - patch_center_phi)
+                ph_hit   = (-ph_hit)        if flip_phi  else ph_hit
+                # AFTER   --------------------------------------------------------------
+                phi_rel = (ph_hit - phi0) % (2*np.pi)          # force into 0 … 2π
+                dphi     = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
 
-            # ph_hit = (ph_hit + np.pi) % (2*np.pi) - np.pi
-            
-            collision = ''
-            bg_u = bg_v = rgb = None
-            # photon getting very close or captured, or initial trajectory angle is less than or equal to max angle 
-            # determined by the observer distance and the schwarzschild radius
-            
-            # bh_angle = np.arctan(bh.rs/2/obs_pos[0]) #this is the disk radius
-            #the shadow radius is related to the impact parameter for plunge photons
-            b_crit = 3 * np.sqrt(3) * bh.rs 
-
-            bh_angle = np.arcsin(b_crit/obs_pos[0])/2
-            
-            
-            if (r_bh <= bh.rs*1.2) or (alpha0s[idx] <= bh_angle):
-                value = (0, 0, 0)
-                collision = 'bh'
-            elif (r_bh >= 100):
-                value = (255, 0, 0)
-                collision = 'numerical error'
-            elif r_bh >= boundary_radius:
-                if bg_array is not None:
+                inside_patch_angle = (dtheta <= patch_size_theta/2) and (dphi <= phi_span/2)
+                
+                if inside_patch_angle:
+                    theta_map = (np.pi - th_hit) if flip_theta else th_hit
                     
-                    th_hit = th_hit % (2 * np.pi)  # Ensure theta is in [0, 2π]
-                    ph_hit = ph_hit % (2 * np.pi)  # Ensure phi is in [0, 2π]
-
-                    dtheta = np.abs(th_hit - patch_center_theta) 
 
                     
-                    # phi_rel = (ph_hit - phi0)
-                    # dphi = np.abs(ph_hit - patch_center_phi)
-                    ph_hit   = (-ph_hit)        if flip_phi  else ph_hit
-                    # AFTER   --------------------------------------------------------------
-                    phi_rel = (ph_hit - phi0) % (2*np.pi)          # force into 0 … 2π
-                    dphi     = np.abs((ph_hit - patch_center_phi + np.pi) % (2*np.pi) - np.pi)
-
-                    inside_patch_angle = (dtheta <= patch_size_theta/2) and (dphi <= phi_span/2)
+                    #method b:
+                    # ── θ → vertical index ─────────────────────────────────────────
+                    u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1) + 0.5)
+                    # ── ϕ → horizontal index (continuous, no wrap seam) ───────────
+                    v = int(phi_rel / phi_span * (w - 1) + 0.5)
+                    u = np.clip(u, 0, h-1)
+                    v = np.clip(v, 0, w-1)
+                    value = tuple(bg_array[u, v])
                     
-                    if inside_patch_angle:
-                        theta_map = (np.pi - th_hit) if flip_theta else th_hit
-                        
+                    #method a:
+                    # # ------- map only the patch, not the whole sky -------------
+                    # u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
+                    # phi_mod = (phi_map - phi0) % (2*np.pi)
+                    # v = int(phi_mod / phi_span * (w - 1))
+                    # # ------------------------------------------------------------
 
-                        
-                        #method b:
-                        # ── θ → vertical index ─────────────────────────────────────────
-                        u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1) + 0.5)
-                        # ── ϕ → horizontal index (continuous, no wrap seam) ───────────
-                        v = int(phi_rel / phi_span * (w - 1) + 0.5)
-                        u = np.clip(u, 0, h-1)
-                        v = np.clip(v, 0, w-1)
-                        value = tuple(bg_array[u, v])
-                        
-                        #method a:
-                        # # ------- map only the patch, not the whole sky -------------
-                        # u = int((theta_map - theta0) / (theta1 - theta0) * (h - 1))
-                        # phi_mod = (phi_map - phi0) % (2*np.pi)
-                        # v = int(phi_mod / phi_span * (w - 1))
-                        # # ------------------------------------------------------------
-
-                        # u = np.clip(u, 0, h-1)
-                        # v = np.clip(v, 0, w-1)
-                        # value = tuple(bg_array[u, v])
-                        # bg_u, bg_v = u, v
-                        # rgb = value
-                        collision = 'escape_bg'
-                    else:
-                        value = (0, 0, 0) #(0, 0, 255)
-                        # value = (0, 0, 0)
-                        collision = 'escape_no_patch'
+                    # u = np.clip(u, 0, h-1)
+                    # v = np.clip(v, 0, w-1)
+                    # value = tuple(bg_array[u, v])
+                    # bg_u, bg_v = u, v
+                    # rgb = value
+                    collision = 'escape_bg'
                 else:
                     value = (0, 0, 0) #(0, 0, 255)
                     # value = (0, 0, 0)
                     collision = 'escape_no_patch'
             else:
-                # value = (255, 0, 0)
-                value = (0, 0, 0)
-                collision = 'in_domain'
-            img[i, j] = value
-            
-            photon_rows.append({'i': i, 'j': j, 
-                                'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit,
-                                'collision': collision, 
-                                'h_r': h_rs[idx].item(), 'h_theta': h_thetas[idx].item(), 'h_phi': h_phis[idx].item(),
-                                'p0_t': p0s[idx, 0].item(), 'p0_r': p0s[idx, 1].item(), 'p0_th': p0s[idx, 2].item(), 'p0_ph': p0s[idx, 3].item(),
-                                'alpha0': alpha0s[idx].item()})
-            
-        plt.imsave('images/manual_output.png', img)
-        logging.info("Saved manual_output.png")
-        print("Saving ray photon data...")
-        pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False)
+                value = (0, 0, 0) #(0, 0, 255)
+                # value = (0, 0, 0)
+                collision = 'escape_no_patch'
+        else:
+            # value = (255, 0, 0)
+            value = (0, 0, 0)
+            collision = 'in_domain'
+        img[i, j] = value
+        
+        photon_rows.append({'i': i, 'j': j, 
+                            'final_r': r_bh, 'final_th': th_hit, 'final_ph': ph_hit,
+                            'collision': collision, 
+                            'h_r': h_rs[idx].item(), 'h_theta': h_thetas[idx].item(), 'h_phi': h_phis[idx].item(),
+                            'p0_t': p0s[idx, 0].item(), 'p0_r': p0s[idx, 1].item(), 'p0_th': p0s[idx, 2].item(), 'p0_ph': p0s[idx, 3].item(),
+                            'alpha0': alpha0s[idx].item(), 'analytic_capture': analytic_capture})
+        
+    plt.imsave('images/manual_output.png', img)
+    logging.info("Saved manual_output.png")
+    print("Saving ray photon data...")
+    pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False)
 
-        # Save sampled trajectories CSV
-        if n_samples > 0 and sampled_traj_data:
-            print("Saving diagnostic sampled trajectories ...")
-            rows = []
-            #use tqdm to show progress
-            for ridx, traj in tqdm(enumerate(sampled_traj_data), desc="Saving diagnostic sampled trajectories", unit="ray"):
-            # for ridx, traj in enumerate(sampled_traj_data):
-                for pidx, (px, py, pz) in enumerate(traj):
-                    pr = np.linalg.norm([px, py, pz])
-                    rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'r': pr, 'h_r': h_rs[ridx], 'h_theta': h_thetas[ridx], 'h_phi': h_phis[ridx]})
-            df = pd.DataFrame(rows)
-            df.to_csv('sampled_rays.csv', index=False)
+    # Save sampled trajectories CSV
+    if n_samples > 0 and sampled_traj_data:
+        print("Saving diagnostic sampled trajectories ...")
+        rows = []
+        #use tqdm to show progress
+        for ridx, traj in tqdm(enumerate(sampled_traj_data), desc="Saving diagnostic sampled trajectories", unit="ray"):
+        # for ridx, traj in enumerate(sampled_traj_data):
+            for pidx, (px, py, pz) in enumerate(traj):
+                pr = np.linalg.norm([px, py, pz])
+                rows.append({'ray_id': ridx, 'point_idx': pidx, 'x': px, 'y': py, 'z': pz, 'r': pr, 'h_r': h_rs[sample_flat_idx[ridx]], 'h_theta': h_thetas[sample_flat_idx[ridx]], 'h_phi': h_phis[sample_flat_idx[ridx]]})
+        df = pd.DataFrame(rows)
+        df.to_csv('sampled_rays.csv', index=False)
 
-        sampled_trajectories = sampled_traj_data
-    else: ######## CPU fallback (cooked)
-        pass
+    sampled_trajectories = sampled_traj_data
 
     # Count summary
     if 'photon_rows' in locals():
