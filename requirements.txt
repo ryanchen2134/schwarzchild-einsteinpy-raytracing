@@ -1,0 +1,10 @@
+numpy
+numba
+einsteinpy
+astropy
+pandas
+matplotlib
+Pillow
+tqdm
+# tests/cuda-test.py only
+torch

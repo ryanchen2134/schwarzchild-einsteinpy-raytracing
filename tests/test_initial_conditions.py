@@ -23,7 +23,7 @@ def test_initial_conditions_vs_einsteinpy():
     pixel_pos = plane_center + dx * width * right + dy * height * up_vec
 
     # Your code
-    q0, p0 = get_initial_conditions(observer_pos, pixel_pos)
+    q0, p0, *_ = get_initial_conditions(observer_pos, pixel_pos)
 
     # EinsteinPy
     r, th, ph = q0[1], q0[2], q0[3]
