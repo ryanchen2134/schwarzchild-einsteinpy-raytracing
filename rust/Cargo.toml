@@ -1,0 +1,26 @@
+[package]
+name = "schwarzschild-rt"
+version = "0.1.0"
+edition = "2021"
+description = "Schwarzschild null-geodesic ray tracer: FANTASY order-2 symplectic integration on the CPU"
+publish = false
+
+[[bin]]
+name = "schwarzschild-rt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rand = "0.8"
+rayon = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"

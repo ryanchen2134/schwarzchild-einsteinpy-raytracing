@@ -4,6 +4,8 @@
 Read the implementation details [here!](Phys_129L_Final_Project_Report-3.pdf) 
 ![Ray Tracing Example](images/manual_output.png)
 
+> **Rust port:** [`rust/`](rust/README.md) holds a CPU implementation of the same pipeline (rayon-parallel, no GPU needed) with golden tests against this Python code.
+
 ## 📜 Overview
 
 This project numerically integrates null geodesics to simulate how light bends around a non-rotating Schwarzschild black hole. By back-tracing rays from an observer's camera through curved spacetime, we recreate gravitational lensing, photon rings, and black hole shadows.
