@@ -1,7 +1,7 @@
 //! 3-vector helpers and coordinate conversions.
 //!
 //! The spherical conventions match `einsteinpy.coordinates.utils` so that
-//! results can be compared against the Python implementation bit for bit:
+//! results can be compared against the Python implementation to rounding:
 //! `θ` is the polar angle from `+z`, `φ` the azimuth from `+x`.
 
 use std::f64::consts::PI;
@@ -51,11 +51,11 @@ pub fn cross(a: Vec3, b: Vec3) -> Vec3 {
     ]
 }
 
-/// `(r, θ, φ)` → `(x, y, z)`.
+/// `(r, θ, φ)` → `(x, y, z)`, in einsteinpy's operation order.
 #[inline]
 pub fn spherical_to_cartesian(r: f64, theta: f64, phi: f64) -> Vec3 {
     let st = theta.sin();
-    [r * st * phi.cos(), r * st * phi.sin(), r * theta.cos()]
+    [r * phi.cos() * st, r * phi.sin() * st, r * theta.cos()]
 }
 
 /// `(x, y, z)` → `(r, θ, φ)` with `θ ∈ [0, π]` and `φ ∈ (−π, π]`.

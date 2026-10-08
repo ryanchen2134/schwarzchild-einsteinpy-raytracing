@@ -2,6 +2,7 @@
 name = "schwarzschild-rt"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Schwarzschild null-geodesic ray tracer: FANTASY order-2 symplectic integration on the CPU"
 publish = false
 

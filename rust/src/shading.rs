@@ -7,6 +7,7 @@ use crate::sky_patch::SkyPatch;
 use crate::texture::{Rgb, Texture};
 
 /// Rays that reach this radius have left the physical domain by a wide margin.
+/// The boundary radius must stay below it (checked by the CLI).
 pub const NUMERICAL_ERROR_RADIUS: f64 = 100.0;
 /// Classification threshold for capture, slightly outside the integrator's exit radius.
 pub const CAPTURE_RADIUS_FACTOR: f64 = 1.2;
@@ -40,7 +41,7 @@ impl Collision {
 pub struct ShadedRay {
     pub colour: Rgb,
     pub collision: Collision,
-    /// Exit direction in the lab frame.
+    /// Exit direction in the lab frame: `θ ∈ [0, π]`, `φ ∈ (−π, π]`.
     pub final_theta: f64,
     pub final_phi: f64,
 }
@@ -55,11 +56,13 @@ pub fn unrotate_hit(q: &[f64; 4], beta: f64) -> (f64, f64) {
     (th, ph)
 }
 
-/// Classify by final radius, as the Python renderer did; the integrator's exit
-/// reason is recorded separately in the photon table.
+/// Classify by final radius, as the Python renderer did, after rejecting radii that
+/// are not physical; the integrator's exit reason is recorded separately.
 #[inline]
 pub fn classify(r_final: f64, rs: f64, boundary_radius: f64, in_patch: bool) -> Collision {
-    if r_final <= CAPTURE_RADIUS_FACTOR * rs {
+    if !r_final.is_finite() || r_final <= 0.0 {
+        Collision::NumericalError
+    } else if r_final <= CAPTURE_RADIUS_FACTOR * rs {
         Collision::BlackHole
     } else if r_final >= NUMERICAL_ERROR_RADIUS {
         Collision::NumericalError
@@ -74,7 +77,7 @@ pub fn classify(r_final: f64, rs: f64, boundary_radius: f64, in_patch: bool) -> 
     }
 }
 
-/// Shade one ray.
+/// Shade one ray. A diverged integration is a numerical error whatever its radius.
 pub fn shade(
     result: &IntegrationResult,
     beta: f64,
@@ -85,7 +88,11 @@ pub fn shade(
 ) -> ShadedRay {
     let (final_theta, final_phi) = unrotate_hit(&result.q, beta);
     let in_patch = texture.is_some() && patch.contains(final_theta, final_phi);
-    let collision = classify(result.q[1], rs, boundary_radius, in_patch);
+    let collision = if result.exit == ExitReason::Diverged {
+        Collision::NumericalError
+    } else {
+        classify(result.q[1], rs, boundary_radius, in_patch)
+    };
     let colour = match collision {
         Collision::EscapedBackground => {
             let tex = texture.expect("in_patch implies a texture");
@@ -95,7 +102,6 @@ pub fn shade(
         Collision::NumericalError => NUMERICAL_ERROR_COLOUR,
         _ => BLACK,
     };
-    let _ = ExitReason::Escaped; // exit reason is carried by `result`, not re-derived here
     ShadedRay {
         colour,
         collision,
@@ -108,6 +114,25 @@ pub fn shade(
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    fn result(r: f64, phi: f64, exit: ExitReason) -> IntegrationResult {
+        IntegrationResult {
+            q: [-40.0, r, PI / 2.0, phi],
+            p: [1.0, -1.0, 0.0, 0.0],
+            exit,
+            n_steps: 100,
+        }
+    }
+
+    fn gradient_texture(h: usize, w: usize) -> Texture {
+        let mut t = Texture::solid(w, h, [0, 0, 0]);
+        for r in 0..h {
+            for c in 0..w {
+                t.data[r * w + c] = [r as u8, c as u8, 7];
+            }
+        }
+        t
+    }
 
     #[test]
     fn unrotate_is_inverse_of_initial_rotation() {
@@ -132,5 +157,104 @@ mod tests {
         );
         assert_eq!(classify(31.0, 2.0, 31.0, false), Collision::EscapedNoPatch);
         assert_eq!(classify(150.0, 2.0, 31.0, true), Collision::NumericalError);
+        assert_eq!(classify(-3.0, 2.0, 31.0, true), Collision::NumericalError);
+        assert_eq!(
+            classify(f64::NAN, 2.0, 31.0, true),
+            Collision::NumericalError
+        );
+        assert_eq!(
+            classify(f64::INFINITY, 2.0, 31.0, true),
+            Collision::NumericalError
+        );
+    }
+
+    #[test]
+    fn shade_colours_each_outcome() {
+        let patch = SkyPatch::full_sky();
+        let tex = gradient_texture(16, 32);
+        let escaped = shade(
+            &result(31.0, 2.0, ExitReason::Escaped),
+            0.0,
+            2.0,
+            31.0,
+            &patch,
+            Some(&tex),
+        );
+        assert_eq!(escaped.collision, Collision::EscapedBackground);
+        let (u, v) = patch.texel(escaped.final_theta, escaped.final_phi, 16, 32);
+        assert_eq!(escaped.colour, tex.texel(u, v));
+        assert_eq!(escaped.colour, [u as u8, v as u8, 7]);
+
+        let no_texture = shade(
+            &result(31.0, 2.0, ExitReason::Escaped),
+            0.0,
+            2.0,
+            31.0,
+            &patch,
+            None,
+        );
+        assert_eq!(no_texture.collision, Collision::EscapedNoPatch);
+        assert_eq!(no_texture.colour, BLACK);
+
+        let narrow = SkyPatch::from_degrees(90.0, 180.0, 10.0, 10.0, 0.0, 0.0, false, false);
+        let outside = shade(
+            &result(31.0, 0.5, ExitReason::Escaped),
+            0.0,
+            2.0,
+            31.0,
+            &narrow,
+            Some(&tex),
+        );
+        assert_eq!(outside.collision, Collision::EscapedNoPatch);
+
+        let far = shade(
+            &result(150.0, 1.0, ExitReason::Escaped),
+            0.0,
+            2.0,
+            31.0,
+            &patch,
+            Some(&tex),
+        );
+        assert_eq!(far.collision, Collision::NumericalError);
+        assert_eq!(far.colour, NUMERICAL_ERROR_COLOUR);
+
+        let diverged = shade(
+            &result(10.0, 1.0, ExitReason::Diverged),
+            0.0,
+            2.0,
+            31.0,
+            &patch,
+            Some(&tex),
+        );
+        assert_eq!(diverged.collision, Collision::NumericalError);
+
+        let captured = shade(
+            &result(2.19, 1.0, ExitReason::Captured),
+            0.0,
+            2.0,
+            31.0,
+            &patch,
+            Some(&tex),
+        );
+        assert_eq!(captured.collision, Collision::BlackHole);
+        assert_eq!(captured.colour, BLACK);
+    }
+
+    #[test]
+    fn flipped_patch_mirrors_the_texel_but_not_the_pixel_classification() {
+        let tex = gradient_texture(16, 32);
+        let plain = SkyPatch::full_sky();
+        let flipped = SkyPatch {
+            flip_theta: true,
+            flip_phi: true,
+            ..plain
+        };
+        let res = result(31.0, 2.5, ExitReason::Escaped);
+        let a = shade(&res, 0.4, 2.0, 31.0, &plain, Some(&tex));
+        let b = shade(&res, 0.4, 2.0, 31.0, &flipped, Some(&tex));
+        assert_eq!(a.collision, b.collision);
+        let (u, v) = plain.texel(PI - a.final_theta, -a.final_phi, 16, 32);
+        assert_eq!(b.colour, tex.texel(u, v));
+        assert_ne!(a.colour, b.colour);
     }
 }

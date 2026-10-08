@@ -1,12 +1,14 @@
 //! Equivalence with the Python implementation (`simulation/`), using fixtures
 //! captured from it under numba's CUDA simulator at commit 7dcfb9f
-//! (`tests/fixtures/`, produced by `tests/fixtures/README.md`'s script).
+//! (`tests/fixtures/`, regenerated with `tests/fixtures/gen_golden.py`).
 
 use schwarzschild_rt::camera::Camera;
 use schwarzschild_rt::coords::{cartesian_to_spherical, spherical_to_cartesian, TWO_PI};
 use schwarzschild_rt::flat::render_flat;
 use schwarzschild_rt::initial_conditions::{initial_conditions, null_p_t};
-use schwarzschild_rt::integrator::{integrate, integrate_trajectory, IntegratorSettings};
+use schwarzschild_rt::integrator::{
+    integrate, integrate_trajectory, ExitReason, IntegratorSettings,
+};
 use schwarzschild_rt::schwarzschild::BlackHole;
 use schwarzschild_rt::shading::{classify, unrotate_hit, Collision};
 use schwarzschild_rt::sky_patch::SkyPatch;
@@ -125,6 +127,9 @@ struct PyFinal {
     q_final: Vec<[f64; 4]>,
 }
 
+/// Tolerances are a few orders above the measured agreement (≈1e-13 in r, 9e-12 in t,
+/// see the README) so that fixtures regenerated on a real GPU, where FMA contraction
+/// changes rounding, still pass, while a change of operation order would not.
 #[test]
 fn integrator_final_states_match_python() {
     let (_, py) = python_initial();
@@ -140,10 +145,17 @@ fn integrator_final_states_match_python() {
     }
     eprintln!("max |Δ(t, r, θ, φ)| vs Python = {worst:?}");
     assert!(
-        worst[1] < 1e-8 && worst[2] < 1e-8 && worst[3] < 1e-8,
+        worst[1] < 1e-11 && worst[2] < 1e-11 && worst[3] < 1e-12,
         "{worst:?}"
     );
-    assert!(worst[0] < 1e-7, "{worst:?}");
+    assert!(worst[0] < 1e-10, "{worst:?}");
+}
+
+#[derive(Deserialize)]
+struct PyTrajRay {
+    ray_index: usize,
+    /// Every state the CUDA kernel recorded, up to and including the exit state.
+    rows: Vec<[f64; 4]>,
 }
 
 #[derive(Deserialize)]
@@ -153,36 +165,47 @@ struct PyTraj {
     omega: f64,
     r_max: f64,
     mass: f64,
-    ray_index: Vec<usize>,
-    traj: Vec<Vec<[f64; 4]>>,
+    rays: Vec<PyTrajRay>,
 }
 
 #[test]
-fn integrator_trajectories_match_python_step_by_step() {
+fn integrator_trajectories_match_python_step_by_step_through_the_exit() {
     let (_, py) = python_initial();
     let tr: PyTraj = load("integrator_traj.json");
     let rs = BlackHole::new(tr.mass).rs();
     let settings = IntegratorSettings::new(tr.steps, tr.delta, tr.omega, tr.r_max, rs);
     let mut worst = 0.0f64;
-    for (&idx, expect) in tr.ray_index.iter().zip(&tr.traj) {
-        let ray = &py.rays[idx];
-        let (traj, _) = integrate_trajectory(ray.q0, ray.p0, rs, &settings);
-        assert_eq!(expect.len(), tr.steps);
-        for (k, e) in expect.iter().enumerate() {
-            if k >= traj.len() {
-                assert!(
-                    e.iter().all(|x| *x == 0.0),
-                    "python buffer past exit must be zero"
-                );
-                continue;
-            }
+    let mut exits = Vec::new();
+    for pyray in &tr.rays {
+        let ray = &py.rays[pyray.ray_index];
+        let (traj, res) = integrate_trajectory(ray.q0, ray.p0, rs, &settings);
+        assert_ne!(res.exit, ExitReason::StepLimit, "fixture ray must exit");
+        assert_eq!(
+            traj.len(),
+            pyray.rows.len(),
+            "ray {}: exit recorded at a different step",
+            pyray.ray_index
+        );
+        for (k, (a, b)) in traj.iter().zip(&pyray.rows).enumerate() {
             for c in 0..4 {
-                worst = worst.max((traj[k][c] - e[c]).abs());
+                let d = (a[c] - b[c]).abs();
+                assert!(
+                    d < 1e-12,
+                    "ray {} step {k} component {c}: {} vs {}",
+                    pyray.ray_index,
+                    a[c],
+                    b[c]
+                );
+                worst = worst.max(d);
             }
         }
+        exits.push(res.exit);
     }
-    eprintln!("max |Δq| over {} recorded steps = {worst:e}", tr.steps);
-    assert!(worst < 1e-9, "{worst}");
+    eprintln!(
+        "max |Δq| over {} recorded rows = {worst:e}",
+        tr.rays.iter().map(|r| r.rows.len()).sum::<usize>()
+    );
+    assert!(exits.contains(&ExitReason::Captured) && exits.contains(&ExitReason::Escaped));
 }
 
 #[derive(Deserialize)]
@@ -197,14 +220,17 @@ struct TexelCase {
     ps_ph: f64,
     flip_theta: bool,
     flip_phi: bool,
-    /// `[inside, u, v]` as `[bool, i64, i64]` encoded as JSON values.
+    /// `[inside, u, v]`.
     result: (bool, i64, i64),
 }
 
+/// The Python "method b" flipped φ before testing membership; the port flips only at
+/// the texel lookup (README difference 4). So membership is compared on the direction
+/// Python tested, and texel indices wherever both rules accept the direction.
 #[test]
 fn texel_rule_matches_python_method_b() {
     let cases: Vec<TexelCase> = load("texel_method_b.json");
-    let mut compared = 0;
+    let (mut compared, mut narrow) = (0, 0);
     for c in &cases {
         let patch = SkyPatch {
             center_theta: c.pc_th,
@@ -214,17 +240,14 @@ fn texel_rule_matches_python_method_b() {
             flip_theta: c.flip_theta,
             flip_phi: c.flip_phi,
         };
-        let inside = patch.contains(c.th, c.ph);
-        if !c.flip_phi {
-            // Python flipped φ before testing membership; without that flip the rules agree.
-            assert_eq!(
-                inside,
-                c.result.0,
-                "membership for {:?}",
-                (c.th, c.ph, c.pc_ph, c.ps_ph)
-            );
-        }
-        if inside && c.result.0 {
+        let python_tested_phi = if c.flip_phi { -c.ph } else { c.ph };
+        assert_eq!(
+            patch.contains(c.th, python_tested_phi),
+            c.result.0,
+            "membership for {:?}",
+            (c.th, c.ph, c.pc_ph, c.ps_ph, c.flip_phi)
+        );
+        if c.result.0 && patch.contains(c.th, c.ph) {
             let (u, v) = patch.texel(c.th, c.ph, c.h, c.w);
             assert_eq!(
                 (u as i64, v as i64),
@@ -233,13 +256,18 @@ fn texel_rule_matches_python_method_b() {
                 (c.th, c.ph, c.flip_theta, c.flip_phi)
             );
             compared += 1;
+            if c.ps_ph < TWO_PI {
+                narrow += 1;
+            }
         }
     }
-    // 240 full-sky cases are always inside; the two narrow patches add a few more.
-    assert!(
-        compared >= 240,
-        "only {compared} of {} cases compared",
+    eprintln!(
+        "texel: {compared} of {} cases compared, {narrow} on narrow patches",
         cases.len()
+    );
+    assert!(
+        compared >= 240 && narrow >= 10,
+        "{compared} compared, {narrow} narrow"
     );
 }
 
@@ -383,5 +411,5 @@ fn end_to_end_pipeline_matches_python_photon_table() {
         );
     }
     eprintln!("e2e: max |Δr| = {worst_r:e}, max angular Δ = {worst_ang:e}");
-    assert!(worst_r < 1e-7 && worst_ang < 1e-7);
+    assert!(worst_r < 1e-9 && worst_ang < 1e-9);
 }

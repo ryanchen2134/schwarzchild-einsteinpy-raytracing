@@ -5,7 +5,7 @@ use crate::camera::Camera;
 use crate::coords::{mat_vec, rot_x, spherical_to_cartesian, Vec3};
 use crate::initial_conditions::{initial_conditions, RayInit};
 use crate::integrator::{
-    integrate_batch, integrate_trajectory, IntegrationResult, IntegratorSettings,
+    integrate_batch, integrate_trajectory_bounded, IntegrationResult, IntegratorSettings,
 };
 use crate::schwarzschild::BlackHole;
 use crate::shading::{shade, ShadedRay};
@@ -47,7 +47,8 @@ pub struct RenderResult {
     pub trajectories: Vec<(usize, Vec<Vec3>)>,
 }
 
-/// Evenly spaced indices into `0..n`, at most `max_points` of them (`numpy.linspace` semantics).
+/// Evenly spaced indices into `0..n` (nearest-rounded), at most `max_points` of them,
+/// always including the first and last.
 pub fn downsample_indices(n: usize, max_points: usize) -> Vec<usize> {
     if n == 0 || max_points == 0 {
         return Vec::new();
@@ -95,16 +96,41 @@ where
         })
         .collect();
 
-    let rays: Vec<([f64; 4], [f64; 4])> = inits.iter().map(|r| (r.q0, r.p0)).collect();
-    let results = integrate_batch(&rays, rs, &cfg.integrator, on_ray_done);
+    let results = integrate_batch(
+        inits.par_iter().map(|r| (r.q0, r.p0)),
+        rs,
+        &cfg.integrator,
+        on_ray_done,
+    );
+
+    // Diagnostic trajectories first: they only need `inits`, which the photon
+    // records consume below.
+    let trajectories = cfg
+        .sample_pixels
+        .par_iter()
+        .map(|&flat| {
+            let init = inits[flat];
+            let (traj, _) = integrate_trajectory_bounded(
+                init.q0,
+                init.p0,
+                rs,
+                &cfg.integrator,
+                cfg.max_trajectory_points,
+            );
+            (
+                flat,
+                trajectory_to_lab(&traj, init.beta, cfg.max_trajectory_points),
+            )
+        })
+        .collect();
 
     let capture_angle = bh.capture_angle(cam.observer_radius());
-    let photons: Vec<PhotonRecord> = (0..n)
+    let photons: Vec<PhotonRecord> = inits
         .into_par_iter()
-        .map(|flat| {
+        .zip(results.into_par_iter())
+        .enumerate()
+        .map(|(flat, (init, result))| {
             let (i, j) = cam.pixel_of(flat);
-            let init = inits[flat];
-            let result = results[flat];
             let shaded = shade(
                 &result,
                 init.beta,
@@ -124,19 +150,6 @@ where
         })
         .collect();
     let image = photons.iter().map(|p| p.shaded.colour).collect();
-
-    let trajectories = cfg
-        .sample_pixels
-        .par_iter()
-        .map(|&flat| {
-            let init = inits[flat];
-            let (traj, _) = integrate_trajectory(init.q0, init.p0, rs, &cfg.integrator);
-            (
-                flat,
-                trajectory_to_lab(&traj, init.beta, cfg.max_trajectory_points),
-            )
-        })
-        .collect();
 
     RenderResult {
         width: cam.width,
@@ -159,19 +172,23 @@ mod tests {
         assert_eq!(downsample_indices(5, 1), vec![0]);
     }
 
-    #[test]
-    fn small_render_classifies_centre_and_edge() {
-        let camera = Camera::new([30.0, 0.0, 0.0], 80f64.to_radians(), 9, 9).unwrap();
+    fn config(size: usize, sample_pixels: Vec<usize>) -> RenderConfig {
+        let camera = Camera::new([30.0, 0.0, 0.0], 80f64.to_radians(), size, size).unwrap();
         let bh = BlackHole::new(1.0);
-        let cfg = RenderConfig {
+        RenderConfig {
             camera,
             black_hole: bh,
             boundary_radius: 31.0,
             patch: SkyPatch::full_sky(),
             integrator: IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, bh.rs()),
-            sample_pixels: vec![0, 40],
+            sample_pixels,
             max_trajectory_points: 50,
-        };
+        }
+    }
+
+    #[test]
+    fn small_render_classifies_centre_and_edge() {
+        let cfg = config(9, vec![0, 40]);
         let tex = Texture::solid(4, 2, [10, 20, 30]);
         let res = render_curved(&cfg, Some(&tex), || {});
         let centre = &res.photons[40];
@@ -189,5 +206,31 @@ mod tests {
         assert!(!corner.analytic_capture);
         assert_eq!(res.trajectories.len(), 2);
         assert!(res.trajectories[1].1.len() <= 50);
+        assert_eq!(res.image.len(), 81);
+        assert_eq!(res.image[0], [10, 20, 30]);
+        assert_eq!(res.image[40], [0, 0, 0]);
+    }
+
+    #[test]
+    fn escaped_pixels_sample_the_texture_at_their_exit_direction() {
+        let cfg = config(5, vec![]);
+        let mut tex = Texture::solid(64, 32, [0, 0, 0]);
+        for r in 0..32 {
+            for c in 0..64 {
+                tex.data[r * 64 + c] = [r as u8, c as u8, 1];
+            }
+        }
+        let res = render_curved(&cfg, Some(&tex), || {});
+        let mut checked = 0;
+        for p in &res.photons {
+            if p.shaded.collision == crate::shading::Collision::EscapedBackground {
+                let (u, v) = cfg
+                    .patch
+                    .texel(p.shaded.final_theta, p.shaded.final_phi, 32, 64);
+                assert_eq!(p.shaded.colour, [u as u8, v as u8, 1]);
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "{checked}");
     }
 }

@@ -34,8 +34,12 @@ pub struct RayInit {
     pub direction: Vec3,
 }
 
-/// Future-directed `p_t > 0` that makes `(p_t, p_r, p_θ, p_φ)` null at radius `r`, polar
-/// angle `θ`, with lapse `f = 1 − 2M/r`. Operation order follows the Python code.
+/// The positive root `p_t > 0` that makes `(p_t, p_r, p_θ, p_φ)` null at radius `r`,
+/// polar angle `θ`, with lapse `f = 1 − 2M/r`. With covariant momenta this means
+/// `p^t = g^{tt} p_t = −p_t / f < 0`: coordinate time *decreases* along the ray, which
+/// is what tracing rays backwards from the camera needs. (The Python docstring calls
+/// this branch "future-directed"; that label belongs to its unused contravariant
+/// reading.) Operation order follows the Python code.
 #[inline]
 pub fn null_p_t(f: f64, r: f64, theta: f64, p_r: f64, p_th: f64, p_ph: f64) -> f64 {
     let gtt = -1.0 / f;
@@ -105,7 +109,10 @@ mod tests {
         let h = -p_t * p_t / f + f * p_r * p_r + p_th * p_th / (r * r) + p_ph * p_ph / (r * r);
         assert!(h.abs() < 1e-12, "H = {h}");
         assert_eq!(p_th, 0.0);
-        assert!(p_t > 0.0, "future directed");
+        assert!(
+            p_t > 0.0,
+            "positive root: p^t = -p_t/f < 0, traced backwards in t"
+        );
         assert!(p_r < 0.0, "inward");
     }
 

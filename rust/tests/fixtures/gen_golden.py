@@ -51,10 +51,16 @@ json.dump(dict(steps=steps, delta=delta, omega=omega, r_max=r_max, mass=mass, q_
 print("integrator final done in %.0fs" % (time.time() - t), flush=True)
 
 # ---------------------------------------------------------------- integrator: full trajectories
-sel = [0, h * w // 2, h * w // 2 + 1, h * w - 1]
-integ2 = CUDASchwarzschildIntegrator(steps=1500, delta=delta, mass=mass, omega=omega, r_max=r_max)
+sel = [0, h * w // 2 + w // 2]  # corner ray (escapes) and a central ray (captured)
+integ2 = CUDASchwarzschildIntegrator(steps=6000, delta=delta, mass=mass, omega=omega, r_max=r_max)
 traj = integ2.integrate_batch_full(q0s[sel], p0s[sel])
-json.dump(dict(steps=1500, delta=delta, omega=omega, r_max=r_max, mass=mass, ray_index=sel, traj=traj.tolist()),
+rays_out = []
+for k, idx in enumerate(sel):
+    rows = traj[k]
+    n = int(np.flatnonzero(rows.any(axis=1))[-1]) + 1  # rows up to and including the exit state
+    assert n < 6000, f"ray {idx} did not exit within the step budget"
+    rays_out.append(dict(ray_index=idx, rows=rows[:n].tolist()))
+json.dump(dict(steps=6000, delta=delta, omega=omega, r_max=r_max, mass=mass, rays=rays_out),
           open(f"{OUT}/integrator_traj.json", "w"))
 print("integrator traj done", flush=True)
 
