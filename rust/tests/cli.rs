@@ -153,3 +153,46 @@ fn invalid_arguments_fail_with_a_message_naming_the_flag() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn exact_and_simd_backends_agree() {
+    let dir = tmp("exact");
+    let a = run(&dir.join("fast"), &["--no-flat", "--backend", "cpu"]);
+    let b = run(
+        &dir.join("exact"),
+        &["--no-flat", "--backend", "cpu", "--exact"],
+    );
+    assert!(
+        a.status.success() && b.status.success(),
+        "{}\n{}",
+        stderr(&a),
+        stderr(&b)
+    );
+    assert!(stderr(&a).contains("backend cpu-simd"), "{}", stderr(&a));
+    assert!(stderr(&b).contains("backend cpu-exact"), "{}", stderr(&b));
+    let fa = std::fs::read_to_string(dir.join("fast").join("photon_data.csv")).unwrap();
+    let fb = std::fs::read_to_string(dir.join("exact").join("photon_data.csv")).unwrap();
+    for (la, lb) in fa.lines().zip(fb.lines()).skip(1) {
+        let a: Vec<&str> = la.split(',').collect();
+        let b: Vec<&str> = lb.split(',').collect();
+        assert_eq!(a[5], b[5], "collision");
+        assert_eq!(a[15], b[15], "exit");
+        assert_eq!(a[16], b[16], "n_steps");
+        let ra: f64 = a[2].parse().unwrap();
+        let rb: f64 = b[2].parse().unwrap();
+        assert!((ra - rb).abs() < 1e-10, "final_r {ra} vs {rb}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn cuda_backend_without_the_feature_explains_how_to_build_it() {
+    if schwarzschild_rt::backend::cuda_compiled_in() {
+        return;
+    }
+    let dir = tmp("cuda");
+    let o = run(&dir.join("out"), &["--backend", "cuda"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("--features cuda"), "{}", stderr(&o));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

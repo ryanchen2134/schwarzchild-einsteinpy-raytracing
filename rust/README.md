@@ -2,8 +2,9 @@
 
 A Rust port of the Schwarzschild ray tracer in the parent directory. It integrates
 null geodesics with the same FANTASY order-2 symplectic scheme as the Python CUDA
-kernel, on the CPU with [rayon](https://docs.rs/rayon), and reproduces the Python
-results to rounding (see *Verification*).
+kernel and reproduces the Python results to rounding (see *Verification*). Three
+backends share one pipeline: a four-lane SIMD integrator on the CPU (the default),
+the scalar reference integrator, and a CUDA kernel.
 
 ```
 cd rust
@@ -11,21 +12,54 @@ cargo build --release
 ./target/release/schwarzschild-rt --size 200 --background ../images/backgrounds/milky-way-equirec.jpg --seed 1
 ```
 
-200×200 pixels with the default 200 000-step budget take about 9 s on four cores.
 `--help` lists every flag. Names follow `config.py` except:
 
 - `--no-flat` replaces `--no-flat-trajectories` (the old spelling is accepted as an alias);
 - `--background` has no default: omit it for a black sky (Python defaults to
   `images/backgrounds/milky-way-equirec.jpg`, relative to the repository root);
 - `--suppress-warnings` and `--no-cuda` do not exist;
-- `--n-sample-rays`, `--seed`, `--max-trajectory-points`, `--out-dir` and `--threads` are new;
+- `--n-sample-rays`, `--seed`, `--max-trajectory-points`, `--out-dir`, `--threads`,
+  `--backend`, `--exact` and `--cuda-device` are new;
 - `--boundary-radius` must stay below 100 (the radius beyond which a ray is reported as
   a numerical error) and `--observer-distance` must exceed the photon sphere, `3M`.
 
 Units: `G = c = 1`; `--bh-mass` sets the unit of length for every radius and for
-`--delta`. The integrator rescales each ray to units of `M` before stepping, so a
+`--delta`. Every backend rescales each ray to units of `M` before stepping, so a
 black hole of any mass runs the same scheme as `M = 1` (see `integrator.rs`); the
 FANTASY mixing angle per step is `2·omega·delta/M`.
+
+## Backends and speed
+
+| `--backend` | What runs | 200×200, 200 000-step budget, 4 cores |
+| --- | --- | --- |
+| `cpu` (default on a CPU-only build) | `integrator_fast`: the step specialised to the equatorial plane every pipeline ray lives in (`θ = π/2`, `p_θ = 0`), four rays per instruction with `wide::f64x4`, rays grouped by impact parameter so lanes finish together | **1.5 s** |
+| `cpu --exact` | `integrator`: the scalar step, operation for operation the Python kernel | 10.9 s |
+| `cuda` | `fantasy.cu`, the same scalar step as a CUDA kernel, compiled with NVRTC at start-up | not measured here (no GPU) |
+| `auto` | `cuda` when the binary has it and a device is present, else `cpu` | |
+
+The SIMD path drops only the `cos(π/2) ≈ 6×10⁻¹⁷` kicks the general step gives `p_θ`;
+on the default scene its photon table is byte-identical to the scalar one, and the
+tests bound the difference at 10⁻¹². Sampled trajectories always come from the scalar
+integrator, which is the only one that records every step.
+
+### CUDA
+
+```
+cargo build --release --features cuda
+./target/release/schwarzschild-rt --backend cuda --size 1000 --background ../images/backgrounds/milky-way-equirec.jpg
+```
+
+Nothing from the CUDA toolkit is needed at build time: `cudarc` loads `libcuda` and
+`libnvrtc` at run time, and the kernel source is embedded in the binary and compiled
+by NVRTC when the backend opens (with `--fmad=false`, so the GPU rounds like the CPU
+and the results agree to rounding). The feature binds the CUDA 12.0 driver API, which
+any 12.x driver serves; for a CUDA 11 driver build with `CUDARC_CUDA_VERSION=11080`
+set. The kernel takes the same scaled inputs as the CPU integrators and returns the
+same exit codes. It was written and reviewed against `integrator.rs` and the Python
+kernel but has not been run in this environment: the test suite checks that it is
+valid C++ (`tests/kernel_syntax.rs`) and that its parameter list matches the host
+launch, not that it runs. Run `cargo test --release --features cuda` and a small
+render on a machine with a GPU before trusting it.
 
 ## Outputs (`--out-dir`, default `output/`)
 
@@ -43,7 +77,10 @@ FANTASY mixing angle per step is `2·omega·delta/M`.
 | --- | --- |
 | `camera` | The pinhole camera: one owner of the image-plane geometry. |
 | `initial_conditions` | Pixel ray → null covariant 4-momentum, rotated into the equatorial plane. |
-| `integrator` | FANTASY order-2 step in units of `M`, exit conditions, batch integration, bounded trajectory recording. |
+| `integrator` | The scalar FANTASY step in units of `M`, exit conditions, bounded trajectory recording. |
+| `integrator_fast` | The equatorial four-lane SIMD step and its batch driver. |
+| `cuda` (feature `cuda`) + `fantasy.cu` | The GPU backend: NVRTC compilation, buffers, launch. |
+| `backend` | The `BatchIntegrator` trait and the three implementations. |
 | `sky_patch` | Which directions carry the texture and the one equirectangular texel rule. |
 | `shading` | Un-rotate the exit, classify, sample the texture. |
 | `render` | The curved pipeline, no I/O. |
@@ -53,7 +90,8 @@ FANTASY mixing angle per step is `2·omega·delta/M`.
 
 ## Differences from the Python implementation
 
-All deliberate; each is pinned by a test named in brackets.
+All deliberate; each is pinned by a test named in brackets. Items 1, 2 and 5 have
+since been ported back into the Python code on `main`.
 
 1. **Radial momentum.** The Python code built `p_r = n_r̂ √f` (the contravariant
    formula) next to the covariant `p_θ`, `p_φ`. That stretched every ray's angle from
@@ -101,19 +139,26 @@ All deliberate; each is pinned by a test named in brackets.
 
 ## Verification
 
-`cargo test --release` runs four layers:
+`cargo test --release` runs five layers:
 
-- unit tests in each module;
+- unit tests in each module, including the SIMD step against the scalar one
+  (`integrator_fast`: exits, step counts and states on 169 pipeline rays, a
+  non-equatorial ray falling back to the scalar path, step-limit and last-step
+  crossings, mass rescaling) and a 24×24 render with both CPU backends
+  (`render::fast_backend_renders_the_same_image_as_the_exact_one`);
 - `tests/golden.rs`: fixtures captured from the Python code under numba's CUDA
   simulator (`tests/fixtures/`, regenerated with `tests/fixtures/gen_golden.py`, about
   20 minutes). Measured agreement, with the asserted bound in brackets: initial
   conditions to 1e-13 (with the documented `p_r` factor) [1e-12]; FANTASY trajectories
   step by step through capture and escape (8 602 recorded states) to 7e-15 [1e-12] and
-  the final states of 48 rays to 1e-13 in `r` and 9e-12 in `t` [1e-11, 1e-10]; flat-render hit points to 1e-9
-  after mirroring [1e-9]; patch membership on all 720 "method b" cases and texel
-  indices on the 264 directions both rules accept; the 16×16 end-to-end photon table
-  (exit radius bit for bit, exit direction to 2e-15 [1e-9], every classification) when
-  integrated from the Python momenta;
+  the final states of 48 rays to 1e-13 in `r` and 9e-12 in `t` [1e-11, 1e-10], from
+  both the scalar and the SIMD integrator; flat-render hit points to 1e-9 after
+  mirroring [1e-9]; patch membership on all 720 "method b" cases and texel indices on
+  the 264 directions both rules accept; the 16×16 end-to-end photon table (exit radius
+  bit for bit, exit direction to 2e-15 [1e-9], every classification) when integrated
+  from the Python momenta;
 - `tests/physics.rs`: closed-form checks that need no reference implementation;
-- `tests/cli.rs`: the binary's files, thread-count determinism, flag parity and
-  argument validation.
+- `tests/cli.rs`: the binary's files, thread-count determinism, flag parity, argument
+  validation, and the SIMD and exact backends agreeing pixel for pixel;
+- `tests/kernel_syntax.rs`: the CUDA kernel compiles as C++ against a shim and its
+  parameter list matches the host launch.

@@ -1,16 +1,16 @@
 //! The curved-spacetime render: camera → initial conditions → integrate →
 //! shade → diagnostic trajectories. No file I/O here; see [`crate::output`].
 
+use crate::backend::BatchIntegrator;
 use crate::camera::Camera;
 use crate::coords::{mat_vec, rot_x, spherical_to_cartesian, Vec3};
 use crate::initial_conditions::{initial_conditions, RayInit};
-use crate::integrator::{
-    integrate_batch, integrate_trajectory_bounded, IntegrationResult, IntegratorSettings,
-};
+use crate::integrator::{integrate_trajectory_bounded, IntegrationResult, IntegratorSettings};
 use crate::schwarzschild::BlackHole;
 use crate::shading::{shade, ShadedRay};
 use crate::sky_patch::SkyPatch;
 use crate::texture::{Rgb, Texture};
+use anyhow::Result;
 use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -74,12 +74,15 @@ pub fn trajectory_to_lab(traj: &[[f64; 4]], beta: f64, max_points: usize) -> Vec
         .collect()
 }
 
-/// Render the scene. `on_ray_done` is called once per integrated ray (progress).
+/// Render the scene with `backend`. `on_ray_done` is called once per integrated ray
+/// (progress). The sampled trajectories always use the scalar integrator, which is
+/// the only one that records every step.
 pub fn render_curved<F>(
     cfg: &RenderConfig,
     texture: Option<&Texture>,
+    backend: &dyn BatchIntegrator,
     on_ray_done: F,
-) -> RenderResult
+) -> Result<RenderResult>
 where
     F: Fn() + Sync,
 {
@@ -96,12 +99,9 @@ where
         })
         .collect();
 
-    let results = integrate_batch(
-        inits.par_iter().map(|r| (r.q0, r.p0)),
-        rs,
-        &cfg.integrator,
-        on_ray_done,
-    );
+    let rays: Vec<([f64; 4], [f64; 4])> = inits.iter().map(|r| (r.q0, r.p0)).collect();
+    let results = backend.integrate_batch(&rays, rs, &cfg.integrator, &on_ray_done)?;
+    drop(rays);
 
     // Diagnostic trajectories first: they only need `inits`, which the photon
     // records consume below.
@@ -151,18 +151,20 @@ where
         .collect();
     let image = photons.iter().map(|p| p.shaded.colour).collect();
 
-    RenderResult {
+    Ok(RenderResult {
         width: cam.width,
         height: cam.height,
         image,
         photons,
         trajectories,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{CpuExact, CpuFast};
+    use crate::shading::Collision;
 
     #[test]
     fn downsample_keeps_endpoints() {
@@ -190,18 +192,12 @@ mod tests {
     fn small_render_classifies_centre_and_edge() {
         let cfg = config(9, vec![0, 40]);
         let tex = Texture::solid(4, 2, [10, 20, 30]);
-        let res = render_curved(&cfg, Some(&tex), || {});
+        let res = render_curved(&cfg, Some(&tex), &CpuExact, || {}).unwrap();
         let centre = &res.photons[40];
-        assert_eq!(
-            centre.shaded.collision,
-            crate::shading::Collision::BlackHole
-        );
+        assert_eq!(centre.shaded.collision, Collision::BlackHole);
         assert!(centre.analytic_capture);
         let corner = &res.photons[0];
-        assert_eq!(
-            corner.shaded.collision,
-            crate::shading::Collision::EscapedBackground
-        );
+        assert_eq!(corner.shaded.collision, Collision::EscapedBackground);
         assert_eq!(corner.shaded.colour, [10, 20, 30]);
         assert!(!corner.analytic_capture);
         assert_eq!(res.trajectories.len(), 2);
@@ -220,10 +216,10 @@ mod tests {
                 tex.data[r * 64 + c] = [r as u8, c as u8, 1];
             }
         }
-        let res = render_curved(&cfg, Some(&tex), || {});
+        let res = render_curved(&cfg, Some(&tex), &CpuExact, || {}).unwrap();
         let mut checked = 0;
         for p in &res.photons {
-            if p.shaded.collision == crate::shading::Collision::EscapedBackground {
+            if p.shaded.collision == Collision::EscapedBackground {
                 let (u, v) = cfg
                     .patch
                     .texel(p.shaded.final_theta, p.shaded.final_phi, 32, 64);
@@ -232,5 +228,34 @@ mod tests {
             }
         }
         assert!(checked >= 20, "{checked}");
+    }
+
+    #[test]
+    fn fast_backend_renders_the_same_image_as_the_exact_one() {
+        let cfg = config(24, vec![3, 300]);
+        let mut tex = Texture::solid(64, 32, [0, 0, 0]);
+        for r in 0..32 {
+            for c in 0..64 {
+                tex.data[r * 64 + c] = [r as u8, c as u8, 1];
+            }
+        }
+        let exact = render_curved(&cfg, Some(&tex), &CpuExact, || {}).unwrap();
+        let fast = render_curved(&cfg, Some(&tex), &CpuFast, || {}).unwrap();
+        assert_eq!(exact.image, fast.image);
+        let mut worst = 0.0f64;
+        for (a, b) in exact.photons.iter().zip(&fast.photons) {
+            assert_eq!(a.shaded.collision, b.shaded.collision);
+            assert_eq!(a.result.exit, b.result.exit);
+            assert_eq!(a.result.n_steps, b.result.n_steps);
+            worst = worst
+                .max((a.result.q[1] - b.result.q[1]).abs())
+                .max((a.shaded.final_phi - b.shaded.final_phi).abs());
+        }
+        eprintln!("render fast vs exact: max |Δ| = {worst:e}");
+        assert!(worst < 1e-12, "{worst}");
+        assert_eq!(exact.trajectories.len(), fast.trajectories.len());
+        for (a, b) in exact.trajectories.iter().zip(&fast.trajectories) {
+            assert_eq!(a, b, "trajectories always come from the scalar integrator");
+        }
     }
 }

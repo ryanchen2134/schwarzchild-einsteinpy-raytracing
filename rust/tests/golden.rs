@@ -9,6 +9,7 @@ use schwarzschild_rt::initial_conditions::{initial_conditions, null_p_t};
 use schwarzschild_rt::integrator::{
     integrate, integrate_trajectory, ExitReason, IntegratorSettings,
 };
+use schwarzschild_rt::integrator_fast::integrate_batch_fast;
 use schwarzschild_rt::schwarzschild::BlackHole;
 use schwarzschild_rt::shading::{classify, unrotate_hit, Collision};
 use schwarzschild_rt::sky_patch::SkyPatch;
@@ -144,6 +145,29 @@ fn integrator_final_states_match_python() {
         }
     }
     eprintln!("max |Δ(t, r, θ, φ)| vs Python = {worst:?}");
+    assert!(
+        worst[1] < 1e-11 && worst[2] < 1e-11 && worst[3] < 1e-12,
+        "{worst:?}"
+    );
+    assert!(worst[0] < 1e-10, "{worst:?}");
+}
+
+/// The SIMD equatorial integrator against the same Python final states.
+#[test]
+fn fast_integrator_final_states_match_python() {
+    let (_, py) = python_initial();
+    let fin: PyFinal = load("integrator_final.json");
+    let rs = BlackHole::new(fin.mass).rs();
+    let settings = IntegratorSettings::new(fin.steps, fin.delta, fin.omega, fin.r_max, rs);
+    let rays: Vec<([f64; 4], [f64; 4])> = py.rays.iter().map(|r| (r.q0, r.p0)).collect();
+    let fast = integrate_batch_fast(&rays, rs, &settings, || {});
+    let mut worst = [0.0f64; 4];
+    for (res, expect) in fast.iter().zip(&fin.q_final) {
+        for k in 0..4 {
+            worst[k] = worst[k].max((res.q[k] - expect[k]).abs());
+        }
+    }
+    eprintln!("fast: max |Δ(t, r, θ, φ)| vs Python = {worst:?}");
     assert!(
         worst[1] < 1e-11 && worst[2] < 1e-11 && worst[3] < 1e-12,
         "{worst:?}"

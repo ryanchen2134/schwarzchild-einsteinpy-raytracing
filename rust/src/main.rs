@@ -1,5 +1,6 @@
-use anyhow::{ensure, Context, Result};
-use clap::Parser;
+use anyhow::{bail, ensure, Context, Result};
+use clap::{Parser, ValueEnum};
+use schwarzschild_rt::backend::{cuda_compiled_in, try_cuda, BatchIntegrator, CpuExact, CpuFast};
 use schwarzschild_rt::camera::Camera;
 use schwarzschild_rt::flat::render_flat;
 use schwarzschild_rt::integrator::IntegratorSettings;
@@ -13,6 +14,16 @@ use schwarzschild_rt::texture::Texture;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BackendChoice {
+    /// CUDA if the binary was built with `--features cuda` and a device is present, else CPU.
+    Auto,
+    /// The CPU: the four-lane SIMD integrator, or the scalar one with `--exact`.
+    Cpu,
+    /// A CUDA device (requires a build with `--features cuda`).
+    Cuda,
+}
 
 /// Schwarzschild black-hole ray tracer (G = c = 1; lengths in the unit of --bh-mass).
 #[derive(Parser, Debug)]
@@ -96,6 +107,16 @@ struct Args {
     /// Worker threads (default: all cores).
     #[arg(long)]
     threads: Option<usize>,
+    /// Where to integrate the rays.
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    backend: BackendChoice,
+    /// On the CPU, use the scalar integrator that reproduces the Python kernel bit for
+    /// bit instead of the SIMD one (about 4× slower; results agree to ~1e-13).
+    #[arg(long)]
+    exact: bool,
+    /// CUDA device ordinal.
+    #[arg(long, default_value_t = 0)]
+    cuda_device: usize,
 }
 
 fn validate(args: &Args) -> Result<()> {
@@ -143,7 +164,45 @@ fn validate(args: &Args) -> Result<()> {
         args.max_trajectory_points > 0,
         "--max-trajectory-points must be at least 1"
     );
+    if args.exact && args.backend == BackendChoice::Cuda {
+        bail!(
+            "--exact selects the scalar CPU integrator; it cannot be combined with --backend cuda"
+        );
+    }
     Ok(())
+}
+
+fn choose_backend(args: &Args) -> Result<Box<dyn BatchIntegrator>> {
+    let cpu: Box<dyn BatchIntegrator> = if args.exact {
+        Box::new(CpuExact)
+    } else {
+        Box::new(CpuFast)
+    };
+    match args.backend {
+        BackendChoice::Cpu => Ok(cpu),
+        BackendChoice::Cuda => {
+            if !cuda_compiled_in() {
+                bail!("this binary was built without the CUDA backend; rebuild with `cargo build --release --features cuda`");
+            }
+            match try_cuda(args.cuda_device)? {
+                Some(dev) => Ok(dev),
+                None => bail!("--backend cuda: no CUDA device found"),
+            }
+        }
+        BackendChoice::Auto => {
+            if args.exact {
+                return Ok(cpu);
+            }
+            match try_cuda(args.cuda_device) {
+                Ok(Some(dev)) => Ok(dev),
+                Ok(None) => Ok(cpu),
+                Err(e) => {
+                    eprintln!("CUDA backend unavailable ({e:#}); using the CPU");
+                    Ok(cpu)
+                }
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -186,12 +245,13 @@ fn main() -> Result<()> {
                 camera.height
             )
         })?;
+    let backend = choose_backend(&args)?;
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("cannot create {}", args.out_dir.display()))?;
 
     let n = camera.n_pixels();
     eprintln!(
-        "{}×{} rays, fov {}°, observer at r = {}, M = {}, steps ≤ {}, δ = {}, ω = {}, texture {}",
+        "{}×{} rays, fov {}°, observer at r = {}, M = {}, steps ≤ {}, δ = {}, ω = {}, texture {}, backend {}",
         args.size,
         args.size,
         args.fov,
@@ -202,7 +262,8 @@ fn main() -> Result<()> {
         args.omega,
         texture
             .as_ref()
-            .map_or("none".to_string(), |t| format!("{}×{}", t.width, t.height))
+            .map_or("none".to_string(), |t| format!("{}×{}", t.width, t.height)),
+        backend.name()
     );
 
     if !args.no_flat {
@@ -242,12 +303,12 @@ fn main() -> Result<()> {
     let done = AtomicUsize::new(0);
     let tick = (n / 20).max(1);
     let t0 = Instant::now();
-    let result = render_curved(&cfg, texture.as_ref(), || {
+    let result = render_curved(&cfg, texture.as_ref(), backend.as_ref(), || {
         let k = done.fetch_add(1, Ordering::Relaxed) + 1;
         if k.is_multiple_of(tick) || k == n {
             eprintln!("integrated {k}/{n} rays ({:.1?})", t0.elapsed());
         }
-    });
+    })?;
     eprintln!("curved render: {:.2?}", t0.elapsed());
 
     write_png(
@@ -298,6 +359,28 @@ mod tests {
         assert!(parse(&["--no-flat-trajectories"]).no_flat);
         assert!(parse(&["--no-flat"]).no_flat);
         assert!(!parse(&[]).no_flat);
+    }
+
+    #[test]
+    fn backend_flags_parse_and_combine_sensibly() {
+        assert_eq!(parse(&[]).backend, BackendChoice::Auto);
+        assert_eq!(parse(&["--backend", "cpu"]).backend, BackendChoice::Cpu);
+        assert_eq!(
+            parse(&["--backend", "cuda", "--cuda-device", "1"]).cuda_device,
+            1
+        );
+        assert!(validate(&parse(&["--backend", "cuda", "--exact"])).is_err());
+        assert!(validate(&parse(&["--backend", "cpu", "--exact"])).is_ok());
+        let cpu = choose_backend(&parse(&["--backend", "cpu"])).unwrap();
+        assert!(cpu.name().starts_with("cpu-simd"));
+        let exact = choose_backend(&parse(&["--backend", "cpu", "--exact"])).unwrap();
+        assert!(exact.name().starts_with("cpu-exact"));
+        if !cuda_compiled_in() {
+            let err = choose_backend(&parse(&["--backend", "cuda"]))
+                .err()
+                .expect("cuda backend must be refused without the feature");
+            assert!(err.to_string().contains("--features cuda"));
+        }
     }
 
     #[test]

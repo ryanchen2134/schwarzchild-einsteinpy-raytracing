@@ -16,6 +16,14 @@ clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rand = "0.8"
 rayon = "1"
+wide = "0.7"
+cudarc = { version = "0.16", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"] }
+
+[features]
+default = []
+# GPU backend: compiles the FANTASY kernel with NVRTC at start-up; needs a CUDA driver at run time only.
+# Binds the CUDA 12.0 driver API (any 12.x driver works). For CUDA 11 build with CUDARC_CUDA_VERSION=11080.
+cuda = ["dep:cudarc", "cudarc/cuda-12000"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
