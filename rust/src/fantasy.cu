@@ -6,8 +6,13 @@
 // rescales every ray so that rs == 2, and scales t, r and p_phi back afterwards.
 // Momenta are covariant: dq^mu/dlambda = g^{mu nu} p_nu.
 //
-// Exit status codes match integrator::ExitReason: 0 step limit, 1 captured,
-// 2 escaped, 3 diverged.
+// The kernel is resumable: each launch advances every unfinished ray by at most
+// round_steps steps and stores the full state (both FANTASY copies, status, step
+// count) back into the buffers, so the host can bound a launch's run time (display
+// GPUs kill long kernels) and report progress between rounds.
+//
+// Exit status codes match integrator::ExitReason: 0 still running / step limit,
+// 1 captured, 2 escaped, 3 diverged.
 
 typedef double real;
 
@@ -123,40 +128,47 @@ __device__ __forceinline__ int exit_reason(const real* q1, const real* q2, real 
     return 0;
 }
 
-extern "C" __global__ void fantasy_integrate(const real* q0s, const real* p0s, int n, int steps,
-                                             real delta, real rs, real r_max, real r_capture, real omega,
-                                             real* out_q, real* out_p, int* out_status, int* out_steps)
+// q1s, p1s, q2s, p2s: both phase-space copies, 4 doubles per ray, read and written.
+// status, n_steps: per ray, read and written. A ray with status != 0 or
+// n_steps >= steps is finished and left untouched.
+extern "C" __global__ void fantasy_integrate(real* q1s, real* p1s, real* q2s, real* p2s,
+                                             int* status, int* n_steps, int n, int steps, int round_steps,
+                                             real delta, real rs, real r_max, real r_capture, real omega)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (status[i] != 0) return;
+    int done = n_steps[i];
+    if (done >= steps) return;
 
     real q1[4], p1[4], q2[4], p2[4];
     for (int a = 0; a < 4; ++a) {
-        q1[a] = q0s[4 * i + a];
-        p1[a] = p0s[4 * i + a];
-        q2[a] = q1[a];
-        p2[a] = p1[a];
+        q1[a] = q1s[4 * i + a];
+        p1[a] = p1s[4 * i + a];
+        q2[a] = q2s[4 * i + a];
+        p2[a] = p2s[4 * i + a];
     }
     const real half = 0.5 * delta;
     real sin_m, cos_m;
     sincos(2.0 * omega * delta, &sin_m, &cos_m);
 
-    int status = 0;
-    int n_steps = 0;
-    for (int s = 0; s < steps; ++s) {
-        status = exit_reason(q1, q2, rs, r_capture, r_max);
-        if (status != 0) break;
+    int st = 0;
+    const int end = (steps - done < round_steps) ? steps : done + round_steps;
+    for (; done < end; ++done) {
+        st = exit_reason(q1, q2, rs, r_capture, r_max);
+        if (st != 0) break;
         fantasy_step(q1, p1, q2, p2, half, rs, cos_m, sin_m);
-        ++n_steps;
     }
-    if (status == 0) {
-        // A boundary crossed on the last permitted step still counts.
-        status = exit_reason(q1, q2, rs, r_capture, r_max);
+    if (st == 0 && done >= steps) {
+        // Budget exhausted: a boundary crossed on the last permitted step still counts.
+        st = exit_reason(q1, q2, rs, r_capture, r_max);
     }
     for (int a = 0; a < 4; ++a) {
-        out_q[4 * i + a] = q1[a];
-        out_p[4 * i + a] = p1[a];
+        q1s[4 * i + a] = q1[a];
+        p1s[4 * i + a] = p1[a];
+        q2s[4 * i + a] = q2[a];
+        p2s[4 * i + a] = p2[a];
     }
-    out_status[i] = status;
-    out_steps[i] = n_steps;
+    status[i] = st;
+    n_steps[i] = done;
 }

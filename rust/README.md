@@ -35,31 +35,46 @@ FANTASY mixing angle per step is `2·omega·delta/M`.
 | `cpu` (default on a CPU-only build) | `integrator_fast`: the step specialised to the equatorial plane every pipeline ray lives in (`θ = π/2`, `p_θ = 0`), four rays per instruction with `wide::f64x4`, rays grouped by impact parameter so lanes finish together | **1.5 s** |
 | `cpu --exact` | `integrator`: the scalar step, operation for operation the Python kernel | 10.9 s |
 | `cuda` | `fantasy.cu`, the same scalar step as a CUDA kernel, compiled with NVRTC at start-up | not measured here (no GPU) |
-| `auto` | `cuda` when the binary has it and a device is present, else `cpu` | |
+| `auto` | `cuda` when the binary has it, the driver and `libnvrtc` load and a device is present, else `cpu` | |
 
-The SIMD path drops only the `cos(π/2) ≈ 6×10⁻¹⁷` kicks the general step gives `p_θ`;
-on the default scene its photon table is byte-identical to the scalar one, and the
-tests bound the difference at 10⁻¹². Sampled trajectories always come from the scalar
-integrator, which is the only one that records every step.
+The SIMD path keeps the scalar step's operation order and nothing contracts to FMA, so
+`t, r, φ, p_t, p_r, p_φ` come out bit-identical to the scalar integrator; the only
+difference is the `cos(π/2) ≈ 6×10⁻¹⁷` kick the general step gives `p_θ`, which the
+tests bound at 10⁻¹². The tests assert bit identity on 169 rays and whole-file
+identity of the photon table, the trajectories and the PNG for a 25×25 and a 5×5 scene,
+using odd sizes so that a lane mix-up could not hide. Sampled trajectories always come
+from the scalar integrator, which is the only one that records every step.
 
 ### CUDA
 
 ```
-cargo build --release --features cuda
+cargo build --release --features cuda-12      # CUDA 12.x driver; --features cuda-11 for 11.8
 ./target/release/schwarzschild-rt --backend cuda --size 1000 --background ../images/backgrounds/milky-way-equirec.jpg
 ```
 
-Nothing from the CUDA toolkit is needed at build time: `cudarc` loads `libcuda` and
-`libnvrtc` at run time, and the kernel source is embedded in the binary and compiled
-by NVRTC when the backend opens (with `--fmad=false`, so the GPU rounds like the CPU
-and the results agree to rounding). The feature binds the CUDA 12.0 driver API, which
-any 12.x driver serves; for a CUDA 11 driver build with `CUDARC_CUDA_VERSION=11080`
-set. The kernel takes the same scaled inputs as the CPU integrators and returns the
-same exit codes. It was written and reviewed against `integrator.rs` and the Python
-kernel but has not been run in this environment: the test suite checks that it is
-valid C++ (`tests/kernel_syntax.rs`) and that its parameter list matches the host
-launch, not that it runs. Run `cargo test --release --features cuda` and a small
-render on a machine with a GPU before trusting it.
+Nothing from the CUDA toolkit is needed at build time. At run time the backend needs
+`libcuda` (the display driver) and `libnvrtc` (from the CUDA toolkit or the NVRTC
+redistributable; it is not part of the driver). The kernel source is embedded in the
+binary and compiled by NVRTC when the backend opens. `auto` probes both libraries
+first: without a driver it uses the CPU; with a driver but no `libnvrtc` it says so
+and stops. `libnvrtc` must not be newer than the driver (the error names
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` when it is).
+
+Rounding: the kernel is compiled with `--fmad=false`, precise division and square
+root and no flush-to-zero, so `+ − × ÷ √` round as on the CPU; the device
+`sin`/`cos`/`sincos` are specified to 2 ulp and are not glibc's code, so GPU and CPU
+results agree to a few ulp per step, not bit for bit, and a few pixels on a
+classification boundary may differ. Each launch advances the rays by at most 4 096
+steps and the host relaunches until all have exited, so no kernel runs long enough
+to trip a display GPU's watchdog and progress is reported between rounds.
+
+The kernel takes the same scaled inputs as the CPU integrators and returns the same
+exit codes. It was written and reviewed against `integrator.rs` and the Python kernel
+but has not been run in this environment: the test suite checks that it is valid C++
+against a shim (`tests/kernel_syntax.rs`, needs `g++` or `clang++`; set
+`SCHWARZSCHILD_RT_SKIP_KERNEL_SYNTAX=1` to skip) and that its typed parameter list
+matches the host launch, not that it runs. Run `cargo test --release --features
+cuda-12` and a small render on a machine with a GPU before trusting it.
 
 ## Outputs (`--out-dir`, default `output/`)
 
@@ -142,9 +157,11 @@ since been ported back into the Python code on `main`.
 `cargo test --release` runs five layers:
 
 - unit tests in each module, including the SIMD step against the scalar one
-  (`integrator_fast`: exits, step counts and states on 169 pipeline rays, a
-  non-equatorial ray falling back to the scalar path, step-limit and last-step
-  crossings, mass rescaling) and a 24×24 render with both CPU backends
+  (`integrator_fast`: bit-identical states, exits and step counts on 169 pipeline
+  rays and on one group of four distinct rays, a non-equatorial ray falling back to
+  the scalar path, step-limit and last-step crossings, mass rescaling, a NaN and a
+  negative-radius lane reported as diverged without touching their neighbours) and a
+  25×25 render with both CPU backends giving identical photon records
   (`render::fast_backend_renders_the_same_image_as_the_exact_one`);
 - `tests/golden.rs`: fixtures captured from the Python code under numba's CUDA
   simulator (`tests/fixtures/`, regenerated with `tests/fixtures/gen_golden.py`, about
@@ -159,6 +176,7 @@ since been ported back into the Python code on `main`.
   from the Python momenta;
 - `tests/physics.rs`: closed-form checks that need no reference implementation;
 - `tests/cli.rs`: the binary's files, thread-count determinism, flag parity, argument
-  validation, and the SIMD and exact backends agreeing pixel for pixel;
+  validation, the SIMD and exact backends writing byte-identical files, and (in a
+  `cuda-*` build) `auto` running on a machine without a device;
 - `tests/kernel_syntax.rs`: the CUDA kernel compiles as C++ against a shim and its
-  parameter list matches the host launch.
+  typed parameter list matches the host launch.

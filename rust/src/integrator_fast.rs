@@ -6,9 +6,10 @@
 //! derivative of the metric at every flow: 12 `sin` and 4 `cos` per step on
 //! constants. This module specialises the step to the equator (`sin θ = 1`,
 //! `cos θ = 0`, `p_θ = 0`), which leaves only arithmetic, and runs four rays per
-//! instruction with [`wide::f64x4`]. Operation order matches the scalar step, so
-//! the results agree with it to rounding (the tests measure the difference); the
-//! only dropped terms are the `cos(π/2) ≈ 6e-17` kicks the scalar code gives `p_θ`.
+//! instruction with [`wide::f64x4`]. Operation order matches the scalar step and
+//! neither rustc nor `wide` contracts to FMA, so `t`, `r`, `φ`, `p_t`, `p_r` and `p_φ`
+//! come out bit-identical to the scalar integrator; the only difference is the
+//! `cos(π/2) ≈ 6e-17` kick the scalar code gives `p_θ`, which the tests bound.
 //!
 //! Rays are sorted by `|p_φ|` (the impact parameter, which sets how long a ray
 //! orbits) before being grouped into lanes, so the four rays of a group finish at
@@ -162,11 +163,12 @@ fn integrate_group(
     let mut snapshot = s;
     let mut n_steps = 0usize;
 
+    // Per-lane exit masks in the scalar integrator's priority: diverged, captured, escaped.
     let classify = |s: &Lanes| -> (u32, u32, u32) {
-        let captured = s.r1.cmp_le(r_cap).move_mask() as u32;
-        let escaped = s.r1.cmp_ge(r_max).move_mask() as u32;
         let diverged = (!s.r1.is_finite() | s.r1.cmp_le(zero) | !s.r2.is_finite() | s.r2.cmp_le(rs))
             .move_mask() as u32;
+        let captured = s.r1.cmp_le(r_cap).move_mask() as u32 & !diverged;
+        let escaped = s.r1.cmp_ge(r_max).move_mask() as u32 & !diverged & !captured;
         (captured, escaped, diverged)
     };
 
@@ -245,8 +247,10 @@ fn copy_lane(dst: &mut Lanes, src: &Lanes, lane: usize) {
 }
 
 /// Integrate many rays with the SIMD equatorial step, four at a time, in parallel.
-/// Non-equatorial rays go through the scalar integrator. `on_ray_done` is called once
-/// per ray (for a SIMD group, four times when the group finishes).
+/// Non-equatorial rays go through the scalar integrator. `on_ray_done` is called
+/// exactly once per input ray: scalar rays fire it as each finishes, SIMD rays once
+/// per real ray in the group when the group finishes (padding copies of a short
+/// final group are not counted).
 pub fn integrate_batch_fast<F>(
     rays: &[([f64; 4], [f64; 4])],
     rs: f64,
@@ -278,11 +282,8 @@ where
 
     // Group rays of similar impact parameter so the lanes finish together.
     let mut order = fast;
-    order.sort_unstable_by(|&a, &b| {
-        let ka = rays[a].1[3].abs();
-        let kb = rays[b].1[3].abs();
-        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // A total order keeps the sort well defined even for a NaN momentum (sorted last).
+    order.sort_unstable_by(|&a, &b| rays[a].1[3].abs().total_cmp(&rays[b].1[3].abs()));
 
     let scaled = |i: usize| {
         let (mut q, mut p) = rays[i];
@@ -339,46 +340,100 @@ mod tests {
             .collect()
     }
 
-    fn compare(fast: &[IntegrationResult], exact: &[IntegrationResult]) -> f64 {
-        let mut worst = 0.0f64;
-        for (f, e) in fast.iter().zip(exact) {
-            assert_eq!(f.exit, e.exit);
-            assert_eq!(f.n_steps, e.n_steps);
-            for k in 0..4 {
-                worst = worst
-                    .max((f.q[k] - e.q[k]).abs())
-                    .max((f.p[k] - e.p[k]).abs());
+    /// Four distinct equatorial rays that exit at different steps.
+    fn distinct_rays() -> Vec<([f64; 4], [f64; 4])> {
+        [0.5, 4.0, 5.2, 8.0]
+            .iter()
+            .map(|&y| {
+                let init = initial_conditions([30.0, 0.0, 0.0], [24.0, y, 0.0], 1.0);
+                (init.q0, init.p0)
+            })
+            .collect()
+    }
+
+    fn settings() -> IntegratorSettings {
+        IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, 2.0)
+    }
+
+    /// Exits and step counts must match; `t, r, θ, φ, p_t, p_r, p_φ` must be bit-identical
+    /// (same operation order, no FMA); `p_θ` may carry the scalar step's `cos(π/2)` kicks.
+    fn assert_same(fast: &[IntegrationResult], exact: &[IntegrationResult]) -> f64 {
+        let mut worst_p_theta = 0.0f64;
+        for (idx, (f, e)) in fast.iter().zip(exact).enumerate() {
+            assert_eq!(f.exit, e.exit, "ray {idx}");
+            assert_eq!(f.n_steps, e.n_steps, "ray {idx}");
+            for k in [0, 1, 2, 3] {
+                assert_eq!(
+                    f.q[k].to_bits(),
+                    e.q[k].to_bits(),
+                    "ray {idx} q[{k}]: {} vs {}",
+                    f.q[k],
+                    e.q[k]
+                );
             }
+            for k in [0, 1, 3] {
+                assert_eq!(
+                    f.p[k].to_bits(),
+                    e.p[k].to_bits(),
+                    "ray {idx} p[{k}]: {} vs {}",
+                    f.p[k],
+                    e.p[k]
+                );
+            }
+            worst_p_theta = worst_p_theta.max((f.p[2] - e.p[2]).abs());
         }
-        worst
+        assert!(worst_p_theta < 1e-12, "p_θ {worst_p_theta}");
+        worst_p_theta
     }
 
     #[test]
-    fn fast_path_matches_the_scalar_integrator() {
-        let rays = pipeline_rays(13, 1.0); // 169 rays: a partial final group of 1
-        let settings = IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, 2.0);
+    fn fast_path_is_bit_identical_to_the_scalar_integrator() {
+        // 169 rays: an odd size, so a lane permutation or a wrong move_mask bit order
+        // would pair different rays and fail; the final group holds one ray.
+        let rays = pipeline_rays(13, 1.0);
         let exact: Vec<_> = rays
             .iter()
-            .map(|(q, p)| integrate(*q, *p, 2.0, &settings))
+            .map(|(q, p)| integrate(*q, *p, 2.0, &settings()))
             .collect();
-        let fast = integrate_batch_fast(&rays, 2.0, &settings, || {});
-        let worst = compare(&fast, &exact);
-        eprintln!("fast vs exact: max |Δ| = {worst:e}");
-        assert!(worst < 1e-12, "{worst}");
+        let fast = integrate_batch_fast(&rays, 2.0, &settings(), || {});
+        let worst = assert_same(&fast, &exact);
+        eprintln!("fast vs exact: max |Δp_θ| = {worst:e}, everything else bit-identical");
         assert!(exact.iter().any(|r| r.exit == ExitReason::Captured));
         assert!(exact.iter().any(|r| r.exit == ExitReason::Escaped));
     }
 
     #[test]
+    fn one_group_of_distinct_rays_keeps_its_lanes_straight() {
+        let rays = distinct_rays();
+        let exact: Vec<_> = rays
+            .iter()
+            .map(|(q, p)| integrate(*q, *p, 2.0, &settings()))
+            .collect();
+        let steps: Vec<usize> = exact.iter().map(|r| r.n_steps).collect();
+        assert_eq!(
+            steps
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4,
+            "the four rays must exit at four different steps: {steps:?}"
+        );
+        assert_eq!(exact[0].exit, ExitReason::Captured);
+        assert_eq!(exact[3].exit, ExitReason::Escaped);
+        let fast = integrate_batch_fast(&rays, 2.0, &settings(), || {});
+        assert_same(&fast, &exact);
+    }
+
+    #[test]
     fn fast_path_rescales_mass_like_the_scalar_integrator() {
-        let rays = pipeline_rays(6, 2.5);
+        let rays = pipeline_rays(7, 2.5);
         let settings = IntegratorSettings::new(20_000, 0.025, 0.01, 77.5, 5.0);
         let exact: Vec<_> = rays
             .iter()
             .map(|(q, p)| integrate(*q, *p, 5.0, &settings))
             .collect();
         let fast = integrate_batch_fast(&rays, 5.0, &settings, || {});
-        assert!(compare(&fast, &exact) < 1e-10);
+        assert_same(&fast, &exact);
     }
 
     #[test]
@@ -395,13 +450,13 @@ mod tests {
 
     #[test]
     fn step_limit_and_last_step_crossing_match_the_scalar_integrator() {
-        let rays = pipeline_rays(4, 1.0);
-        let full = IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, 2.0);
+        let rays = distinct_rays();
+        let full = settings();
         let exact_full: Vec<_> = rays
             .iter()
             .map(|(q, p)| integrate(*q, *p, 2.0, &full))
             .collect();
-        let n = exact_full[0].n_steps;
+        let n = exact_full[3].n_steps;
         for steps in [n, n - 1, 10] {
             let s = IntegratorSettings { steps, ..full };
             let exact: Vec<_> = rays
@@ -409,19 +464,50 @@ mod tests {
                 .map(|(q, p)| integrate(*q, *p, 2.0, &s))
                 .collect();
             let fast = integrate_batch_fast(&rays, 2.0, &s, || {});
-            assert!(compare(&fast, &exact) < 1e-12, "steps {steps}");
+            assert_same(&fast, &exact);
         }
+    }
+
+    #[test]
+    fn a_nan_lane_is_diverged_and_leaves_the_other_lanes_untouched() {
+        let mut rays = distinct_rays();
+        let clean = integrate_batch_fast(&rays, 2.0, &settings(), || {});
+        rays[1].0[1] = f64::NAN;
+        let fast = integrate_batch_fast(&rays, 2.0, &settings(), || {});
+        assert_eq!(fast[1].exit, ExitReason::Diverged);
+        assert_eq!(fast[1].n_steps, 0);
+        for k in [0, 2, 3] {
+            assert_eq!(fast[k].exit, clean[k].exit);
+            assert_eq!(fast[k].n_steps, clean[k].n_steps);
+            assert_eq!(fast[k].q, clean[k].q);
+            assert_eq!(fast[k].p, clean[k].p);
+        }
+        let exact = integrate(rays[1].0, rays[1].1, 2.0, &settings());
+        assert_eq!(exact.exit, ExitReason::Diverged);
+    }
+
+    #[test]
+    fn a_non_positive_radius_is_diverged_not_captured() {
+        let mut rays = distinct_rays();
+        rays[2].0[1] = -1.0;
+        let fast = integrate_batch_fast(&rays, 2.0, &settings(), || {});
+        assert_eq!(fast[2].exit, ExitReason::Diverged);
+        assert_eq!(fast[2].n_steps, 0);
+        let exact = integrate(rays[2].0, rays[2].1, 2.0, &settings());
+        assert_eq!(exact.exit, ExitReason::Diverged);
     }
 
     #[test]
     fn progress_callback_fires_once_per_ray() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let rays = pipeline_rays(5, 1.0);
-        let count = AtomicUsize::new(0);
-        let settings = IntegratorSettings::new(100, 0.01, 0.01, 31.0, 2.0);
-        let _ = integrate_batch_fast(&rays, 2.0, &settings, || {
-            count.fetch_add(1, Ordering::Relaxed);
-        });
-        assert_eq!(count.load(Ordering::Relaxed), 25);
+        for size in [1, 2, 3, 5] {
+            let rays = pipeline_rays(size, 1.0);
+            let count = AtomicUsize::new(0);
+            let settings = IntegratorSettings::new(100, 0.01, 0.01, 31.0, 2.0);
+            let _ = integrate_batch_fast(&rays, 2.0, &settings, || {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(count.load(Ordering::Relaxed), size * size);
+        }
     }
 }

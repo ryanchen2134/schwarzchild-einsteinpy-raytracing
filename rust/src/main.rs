@@ -110,8 +110,9 @@ struct Args {
     /// Where to integrate the rays.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     backend: BackendChoice,
-    /// On the CPU, use the scalar integrator that reproduces the Python kernel bit for
-    /// bit instead of the SIMD one (about 4× slower; results agree to ~1e-13).
+    /// On the CPU, use the scalar reference integrator (operation for operation the
+    /// Python kernel, which it matches to rounding) instead of the SIMD one. Several
+    /// times slower; the two give the same photon table (see README, "Backends and speed").
     #[arg(long)]
     exact: bool,
     /// CUDA device ordinal.
@@ -182,11 +183,13 @@ fn choose_backend(args: &Args) -> Result<Box<dyn BatchIntegrator>> {
         BackendChoice::Cpu => Ok(cpu),
         BackendChoice::Cuda => {
             if !cuda_compiled_in() {
-                bail!("this binary was built without the CUDA backend; rebuild with `cargo build --release --features cuda`");
+                bail!("this binary was built without the CUDA backend; rebuild with `cargo build --release --features cuda-12` (or cuda-11)");
             }
             match try_cuda(args.cuda_device)? {
                 Some(dev) => Ok(dev),
-                None => bail!("--backend cuda: no CUDA device found"),
+                None => bail!(
+                    "--backend cuda: no CUDA driver library or no CUDA device on this machine"
+                ),
             }
         }
         BackendChoice::Auto => {

@@ -1,18 +1,29 @@
 //! Without a GPU the CUDA kernel cannot run here, but its C++ can be checked: compile
 //! `fantasy.cu` with the host compiler against a shim that defines the CUDA keywords
-//! and built-ins. Skips when no `g++`/`clang++` is on the PATH.
+//! and built-ins (the shim supplies `sincos` itself where the host libm lacks it).
+//! Needs `g++` or `clang++` on the PATH; set `SCHWARZSCHILD_RT_SKIP_KERNEL_SYNTAX=1`
+//! to skip on a machine without one.
 
 use schwarzschild_rt::backend::CUDA_KERNEL_SOURCE;
 use std::process::Command;
 
 const SHIM: &str = r#"
 #include <math.h>
+#if !defined(__GLIBC__)
+static inline void sincos(double x, double* s, double* c) { *s = sin(x); *c = cos(x); }
+#endif
 #define __global__
 #define __device__
 #define __forceinline__ inline
 struct dim3_t { unsigned x, y, z; };
 static dim3_t threadIdx, blockIdx, blockDim;
 "#;
+
+/// The kernel's parameter list, as the host launch in `cuda.rs` pushes it: this is
+/// the only ABI check available without a device, so it includes the types.
+const EXPECTED_SIGNATURE: &str = "fantasy_integrate(real* q1s, real* p1s, real* q2s, real* p2s, \
+int* status, int* n_steps, int n, int steps, int round_steps, \
+real delta, real rs, real r_max, real r_capture, real omega)";
 
 #[test]
 fn cuda_kernel_is_valid_cplusplus() {
@@ -24,8 +35,11 @@ fn cuda_kernel_is_valid_cplusplus() {
             .unwrap_or(false)
     });
     let Some(compiler) = compiler else {
-        eprintln!("no C++ compiler on PATH; skipping the kernel syntax check");
-        return;
+        if std::env::var_os("SCHWARZSCHILD_RT_SKIP_KERNEL_SYNTAX").is_some() {
+            eprintln!("no C++ compiler on PATH; skipping the kernel syntax check");
+            return;
+        }
+        panic!("no g++/clang++ on PATH; install one or set SCHWARZSCHILD_RT_SKIP_KERNEL_SYNTAX=1 to skip the CUDA kernel syntax check");
     };
     let dir = std::env::temp_dir().join(format!("schwarzschild-rt-kernel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -54,33 +68,18 @@ fn cuda_kernel_is_valid_cplusplus() {
 
 #[test]
 fn kernel_signature_matches_the_host_launch() {
-    // The host passes: q0s, p0s, n, steps, delta, rs, r_max, r_capture, omega, out_q, out_p,
-    // out_status, out_steps. Keep the kernel's parameter list in that order.
+    assert!(
+        CUDA_KERNEL_SOURCE.contains("typedef double real;"),
+        "the host pushes f64; `real` must stay double"
+    );
     let sig_start = CUDA_KERNEL_SOURCE
         .find("fantasy_integrate(")
         .expect("kernel entry point");
-    let sig_end = sig_start + CUDA_KERNEL_SOURCE[sig_start..].find(')').unwrap();
-    let sig = &CUDA_KERNEL_SOURCE[sig_start..sig_end];
-    let params: Vec<&str> = sig
-        .split(',')
-        .map(|p| p.trim().rsplit(' ').next().unwrap().trim_start_matches('*'))
-        .collect();
-    assert_eq!(
-        params,
-        [
-            "q0s",
-            "p0s",
-            "n",
-            "steps",
-            "delta",
-            "rs",
-            "r_max",
-            "r_capture",
-            "omega",
-            "out_q",
-            "out_p",
-            "out_status",
-            "out_steps"
-        ]
-    );
+    let sig_end = sig_start + CUDA_KERNEL_SOURCE[sig_start..].find(')').unwrap() + 1;
+    let normalised = CUDA_KERNEL_SOURCE[sig_start..sig_end]
+        .replace("__restrict__", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(normalised, EXPECTED_SIGNATURE);
 }

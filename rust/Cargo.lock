@@ -450,6 +450,7 @@ dependencies = [
  "clap",
  "cudarc",
  "image",
+ "libloading",
  "rand",
  "rayon",
  "serde",

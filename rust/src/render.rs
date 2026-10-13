@@ -232,7 +232,8 @@ mod tests {
 
     #[test]
     fn fast_backend_renders_the_same_image_as_the_exact_one() {
-        let cfg = config(24, vec![3, 300]);
+        // 25×25: an odd size, so a lane permutation would pair different rays.
+        let cfg = config(25, vec![3, 300]);
         let mut tex = Texture::solid(64, 32, [0, 0, 0]);
         for r in 0..32 {
             for c in 0..64 {
@@ -242,17 +243,15 @@ mod tests {
         let exact = render_curved(&cfg, Some(&tex), &CpuExact, || {}).unwrap();
         let fast = render_curved(&cfg, Some(&tex), &CpuFast, || {}).unwrap();
         assert_eq!(exact.image, fast.image);
-        let mut worst = 0.0f64;
+        assert_eq!(exact.photons.len(), fast.photons.len());
         for (a, b) in exact.photons.iter().zip(&fast.photons) {
             assert_eq!(a.shaded.collision, b.shaded.collision);
             assert_eq!(a.result.exit, b.result.exit);
             assert_eq!(a.result.n_steps, b.result.n_steps);
-            worst = worst
-                .max((a.result.q[1] - b.result.q[1]).abs())
-                .max((a.shaded.final_phi - b.shaded.final_phi).abs());
+            assert_eq!(a.result.q, b.result.q, "pixel ({}, {})", a.i, a.j);
+            assert_eq!(a.shaded.final_theta, b.shaded.final_theta);
+            assert_eq!(a.shaded.final_phi, b.shaded.final_phi);
         }
-        eprintln!("render fast vs exact: max |Δ| = {worst:e}");
-        assert!(worst < 1e-12, "{worst}");
         assert_eq!(exact.trajectories.len(), fast.trajectories.len());
         for (a, b) in exact.trajectories.iter().zip(&fast.trajectories) {
             assert_eq!(a, b, "trajectories always come from the scalar integrator");

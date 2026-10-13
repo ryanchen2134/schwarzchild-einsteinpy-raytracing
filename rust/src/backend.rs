@@ -14,7 +14,8 @@ pub trait BatchIntegrator: Sync {
     /// Human-readable name for logs.
     fn name(&self) -> String;
 
-    /// Integrate every ray. `on_ray_done` is called once per ray for progress.
+    /// Integrate every ray. `on_ray_done` is called once per ray for progress; a
+    /// device backend may report in batches as launches complete.
     fn integrate_batch(
         &self,
         rays: &[([f64; 4], [f64; 4])],
@@ -83,11 +84,7 @@ impl BatchIntegrator for crate::cuda::CudaIntegrator {
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
     ) -> Result<Vec<IntegrationResult>> {
-        let results = crate::cuda::CudaIntegrator::integrate_batch(self, rays, rs, settings)?;
-        for _ in 0..rays.len() {
-            on_ray_done();
-        }
-        Ok(results)
+        crate::cuda::CudaIntegrator::integrate_batch(self, rays, rs, settings, on_ray_done)
     }
 }
 
@@ -97,13 +94,31 @@ pub const fn cuda_compiled_in() -> bool {
 }
 
 /// Open a CUDA backend if the build has one and a device is present.
+///
+/// `Ok(None)` means there is nothing to use (no driver library, or no device):
+/// the caller falls back to the CPU. `Err` means CUDA is there but unusable
+/// (missing NVRTC, bad device ordinal, compilation or driver error).
 #[cfg(feature = "cuda")]
 pub fn try_cuda(ordinal: usize) -> Result<Option<Box<dyn BatchIntegrator>>> {
-    if crate::cuda::device_count() == 0 {
-        return Ok(None);
+    use crate::cuda::{
+        catch_cuda_panic, device_count, probe_libraries, CudaIntegrator, MissingLibrary,
+    };
+    match probe_libraries() {
+        Err(MissingLibrary::Driver) => return Ok(None),
+        Err(MissingLibrary::Nvrtc) => anyhow::bail!(
+            "libnvrtc not found: the CUDA driver is present but the runtime compiler is not; \
+             install the CUDA toolkit's NVRTC package (it is not part of the display driver)"
+        ),
+        Ok(()) => {}
     }
-    let dev = crate::cuda::CudaIntegrator::new(ordinal)?;
-    Ok(Some(Box::new(dev)))
+    // cudarc panics instead of erroring when a symbol is missing; keep that an error.
+    catch_cuda_panic(|| {
+        if device_count() == 0 {
+            return Ok(None);
+        }
+        let dev = CudaIntegrator::new(ordinal)?;
+        Ok(Some(Box::new(dev) as Box<dyn BatchIntegrator>))
+    })
 }
 
 /// Open a CUDA backend if the build has one and a device is present.
