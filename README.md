@@ -14,7 +14,7 @@ The final output demonstrates how black holes appear to distant observers—mimi
 
 ## Key Features
 
-- **Geodesic Integration**: Solves the null geodesic equations using a symplectic integrator (`FANTASY` via EinsteinPy)
+- **Geodesic Integration**: Solves the null geodesic equations with the `FANTASY` order-2 symplectic scheme, implemented as a Numba-CUDA kernel (EinsteinPy is used only by the diagnostic scripts and tests). Run the kernels on the CPU with `NUMBA_ENABLE_CUDASIM=1`.
 - **GPU Acceleration**: Massive speedup through Numba-CUDA support
 - **Realistic Rendering**: Projects a background panorama to simulate lensing distortions
 - **Schwarzschild Geometry**: Pure Schwarzschild spacetime with no spin

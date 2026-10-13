@@ -6,13 +6,17 @@ import logging
 logging.getLogger('numba').setLevel(logging.ERROR)
 
 # ----------------------------------------------------------------------------
-# Flat-space ray–tracing kernels (GPU)
+# Numba-CUDA kernels
 # ----------------------------------------------------------------------------
-# These utilities are used by simulation.background.save_no_gravity_image_with_background
-# to render background-mapped rays on the GPU.  They do *not* integrate curved
-# geodesics.  All previous GPU Schwarzschild integrator code has been removed –
-# curved geodesics are now handled exclusively through EinsteinPy on the CPU to
-# ensure numerical consistency with the reference library.
+# (a) Flat-space background ray tracing (_flat_raytrace_kernel*, cuda_flat_raytrace*):
+#     not called by main.py, and still using the old modular phi-interval test.
+# (b) The FANTASY order-2 symplectic integrator for Schwarzschild null geodesics
+#     (fantasy_integrate_batch_ord2*, CUDASchwarzschildIntegrator): the only geodesic
+#     integrator the pipeline uses. It mirrors einsteinpy.integrators.fantasy with the
+#     analytic Schwarzschild metric; EinsteinPy itself is not used at run time.
+#     State is (q^mu, p_mu) with COVARIANT momenta, H = 1/2 g^{mu nu} p_mu p_nu.
+#     Lengths inside the kernels are in units of M (rs = 2); the wrapper class
+#     rescales every batch. Run on the CPU with NUMBA_ENABLE_CUDASIM=1.
 # ----------------------------------------------------------------------------
 
 @cuda.jit
@@ -410,7 +414,6 @@ def _metric_contravariant(q, rs, g):
     for a in range(4):
         for b in range(4):
             g[a, b] = 0.0
-    inv_fac = 1.0 - rs / r / 1.0  # rs = 2M ; but rs passed directly
     inv_fac = 1.0 - rs / r
     g[0, 0] = -1.0 / inv_fac
     g[1, 1] = inv_fac
@@ -447,7 +450,7 @@ def _metric_derivative(q, rs, wrt, gprime):
 
 @cuda.jit(device=True)
 def _part_ham_flow(q, p, rs, wrt):
-    """0.5 * (∂g / ∂q^{wrt})_{ab} p^a p^b ."""
+    """∂H/∂q^{wrt} = 0.5 * (∂g^{ab}/∂q^{wrt}) p_a p_b  (inverse metric, covariant p)."""
     Gp = cuda.local.array((4,4), dtype=float64)
     _metric_derivative(q, rs, wrt, Gp)
     acc = 0.0
@@ -460,7 +463,7 @@ def _part_ham_flow(q, p, rs, wrt):
 
 @cuda.jit(device=True)
 def _metric_vec_mul(q, p, rs, out):
-    """out = g^{ab} p_b (contravariant metric times contravariant mom)."""
+    """out^a = ∂H/∂p_a = g^{ab} p_b  (inverse metric times covariant momentum) = dq^a/dλ."""
     G = cuda.local.array((4,4), dtype=float64)
     _metric_contravariant(q, rs, G)
     for a in range(4):

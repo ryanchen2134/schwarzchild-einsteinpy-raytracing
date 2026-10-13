@@ -64,11 +64,18 @@ def _ray(alpha, mass):
 
 
 def test_metric_derivative_uses_rs_not_a_hard_coded_2():
+    """Evaluate the device function through a one-thread kernel so the test runs under
+    the CUDA simulator and on a real GPU alike."""
+    from numba import cuda
     from simulation.cuda_geodesic import _metric_derivative
+
+    @cuda.jit
+    def kernel(q, rs, wrt, gprime):
+        _metric_derivative(q, rs, wrt, gprime)
 
     q = np.array([0.0, 7.0, np.pi / 2, 0.0])
     gprime = np.zeros((4, 4))
-    _metric_derivative(q, 4.0, 1, gprime)  # M = 2
+    kernel[1, 1](q, 4.0, 1, gprime)  # M = 2
     assert gprime[0, 0] == pytest.approx(4.0 / (7.0 - 4.0) ** 2)
     assert gprime[1, 1] == pytest.approx(4.0 / 49.0)
 
@@ -97,8 +104,25 @@ def test_integrator_is_scale_free_in_the_mass():
     # The trajectory kernel is rescaled the same way.
     traj1 = unit.integrate_batch_full(q1, p1)
     traj2 = two.integrate_batch_full(q2, p2)
+    assert np.array_equal(traj2[:, :, 0], 2.0 * traj1[:, :, 0])
     assert np.array_equal(traj2[:, :, 1], 2.0 * traj1[:, :, 1])
+    assert np.array_equal(traj2[:, :, 2], traj1[:, :, 2])
     assert np.array_equal(traj2[:, :, 3], traj1[:, :, 3])
+
+
+def test_escape_radius_is_scaled_with_the_mass():
+    """An outward ray must leave through r_max at the same r/M for every mass; this pins
+    the r_max / M argument, which the inward alpha = 0.2 ray above never reaches."""
+    from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
+
+    q1, p1 = _ray(2.9, 1.0)
+    q2, p2 = _ray(2.9, 2.0)
+    unit = CUDASchwarzschildIntegrator(steps=400, delta=0.01, mass=1.0, omega=0.01, r_max=31.0)
+    two = CUDASchwarzschildIntegrator(steps=400, delta=0.02, mass=2.0, omega=0.01, r_max=62.0)
+    out1, _ = unit.integrate_batch(q1, p1)
+    out2, _ = two.integrate_batch(q2, p2)
+    assert 31.0 <= out1[0, 1] < 31.0 + 2 * 0.01, "the cutoff fired within one step of r_max"
+    assert out2[0, 1] == 2.0 * out1[0, 1]
 
 
 def test_unit_mass_run_is_unchanged_by_the_rescaling():

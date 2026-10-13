@@ -37,31 +37,33 @@ def _apply_relative_offsets(theta_base_deg, phi_base_deg,
 
 
 def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
-    """Return contravariant null 4-momentum p^μ = (p^t, p^r, p^θ, p^φ).
+    """Return the covariant null 4-momentum p_μ = (p_t, p_r, p_θ, p_φ).
 
-    This faithfully reproduces the root selection used by EinsteinPy's internal
-    `_P()` routine but allows an arbitrary black-hole mass *mass_bh*.
+    The FANTASY integrator's Hamiltonian is H = ½ g^{μν} p_μ p_ν, so the momenta
+    are covariant throughout: this solves g^{μν} p_μ p_ν = 0 for p_t. The root
+    selection mirrors EinsteinPy's internal `_P()` routine but allows an
+    arbitrary black-hole mass *mass_bh*.
 
     Parameters
     ----------
     p_sph : array_like, shape (3,)
-        Spatial contravariant momentum components `(p^r, p^θ, p^φ)` in the
-        coordinate basis.
+        Covariant spatial components `(p_r, p_θ, p_φ)`, as returned by
+        `angles_to_p_sph(..., normalise=True)`.
     pos_sph : array_like, shape (3,)
         Observer position `(r, θ, φ)`.
     mass_bh : float, default 1.0
         Black-hole mass *M* (G = c = 1).  The metric becomes flat as
         `mass_bh → 0`.
     future : bool, default False
-        Choose the future-directed (`p^t > 0`) solution if *True*.  The default
-        *False* returns the past-directed branch (negative p^t) for
-        consistency with earlier code based on
-        `compute_null_4momentum_schwarzschild`, which supplied the negative
-        root.
+        If *True* pick `p_t > 0`, i.e. `p^t = g^{tt} p_t = -p_t / f < 0`:
+        coordinate time *decreases* along the ray, which is what tracing rays
+        backwards from the camera needs. The default *False* returns `p_t < 0`
+        (`p^t > 0`) for consistency with earlier code based on
+        `compute_null_4momentum_schwarzschild`.
     """
 
-    pr, pth, pph = p_sph
-    r, th, _ = pos_sph 
+    pr, pth, pph = p_sph  # covariant components
+    r, th, _ = pos_sph
 
     f = 1.0 - 2.0 * mass_bh / r
     if f <= 0.0:
@@ -72,7 +74,7 @@ def build_null_4momentum_ep_sph(p_sph, pos_sph, *, mass_bh=1.0, future=False):
     gthth = 1.0 / (r * r)
     gphph = 1.0 / (r * r * math.sin(th) ** 2)
 
-    # Null condition: g^{μν} p_μ p_ν = 0  ->  quadratic in p^t
+    # Null condition: g^{μν} p_μ p_ν = 0  ->  quadratic in the covariant p_t
     A = gtt  # < 0
     C = grr * pr * pr + gthth * pth * pth + gphph * pph * pph
 

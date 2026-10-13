@@ -26,6 +26,14 @@ def main():
     mass_bh = args.bh_mass
     boundary_radius = args.boundary_radius
     observer_x = args.observer_distance
+    if not mass_bh > 0:
+        raise SystemExit(f"--bh-mass must be positive, got {mass_bh}")
+    if not observer_x > 3.0 * mass_bh:
+        raise SystemExit(f"--observer-distance ({observer_x}) must exceed the photon sphere, 3 M = {3.0 * mass_bh}")
+    if not boundary_radius > observer_x:
+        raise SystemExit(f"--boundary-radius ({boundary_radius}) must exceed --observer-distance ({observer_x})")
+    if not boundary_radius < 100.0 * mass_bh:
+        raise SystemExit(f"--boundary-radius ({boundary_radius}) must stay below the numerical-error radius 100 M = {100.0 * mass_bh}")
     bh = BlackHole(mass=mass_bh)
     observer_pos = np.array([observer_x, 0, 0])
     observer = Observer(position=observer_pos, fov=fov_rad, image_size=image_size)

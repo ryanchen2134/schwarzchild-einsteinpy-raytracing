@@ -9,7 +9,6 @@ from .blackhole import BlackHole, Observer
 from PIL import Image
 import pandas as pd
 from simulation.utils import get_initial_conditions
-import warnings  # CUDA curved geodesic path removed
 from simulation.utils import spherical_to_cartesian_fast, cartesian_to_spherical_fast
 
 
@@ -208,10 +207,16 @@ def run_manual_simulation(
         bh_angle = np.arcsin(b_crit / r_obs * np.sqrt(1.0 - 2.0 * bh.mass / r_obs))
         analytic_capture = bool(alpha0s[idx] <= bh_angle)
 
-        if r_bh <= bh.rs*1.2:
+        # Rays beyond this radius left the domain by a wide margin; in units of M like
+        # the rest of the pipeline (100 at M = 1, so the default run is unchanged).
+        numerical_error_radius = 100.0 * bh.mass
+        if not np.isfinite(r_bh) or r_bh <= 0.0:
+            value = (255, 0, 0)
+            collision = 'numerical error'
+        elif r_bh <= bh.rs*1.2:
             value = (0, 0, 0)
             collision = 'bh'
-        elif (r_bh >= 100):
+        elif r_bh >= numerical_error_radius:
             value = (255, 0, 0)
             collision = 'numerical error'
         elif r_bh >= boundary_radius:
