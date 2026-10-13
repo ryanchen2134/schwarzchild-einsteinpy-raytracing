@@ -137,7 +137,8 @@ def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
     q0 = np.array([0.0, r_obs, theta_obs, phi_obs])
 
     _, h_r, h_theta, h_phi = cartesian_to_spherical_fast(0, *ray_dir)
-    alpha0 = np.arccos(-p_spatial[0] / np.sqrt(1.0 - 2.0 * mass_bh / r_obs))  # renormalize to flat geometry
+    # p_r = n_rhat / sqrt(f)  =>  n_rhat = p_r * sqrt(f) = -cos(alpha)
+    alpha0 = np.arccos(-p_spatial[0] * np.sqrt(1.0 - 2.0 * mass_bh / r_obs))
     return q0, p0, alpha0, h_r, h_theta, h_phi, beta
 
 
@@ -146,14 +147,25 @@ def get_initial_conditions(observer_pos, pixel_pos, *, mass_bh=1.0):
 # -----------------------------------------------------------------------------
 
 def angles_to_p_sph(alpha, beta, r_obs, *, mass_bh=1.0, normalise=True):
-    """Return coordinate-basis momentum components `(p^r, p^θ, p^φ)` for a ray
-    emitted from the observer on the **+x axis** (θ = π/2, φ = 0) that makes
+    """Return *covariant* momentum components `(p_r, p_θ, p_φ)` for a ray
+    emitted from a static observer on the **+x axis** (θ = π/2, φ = 0) that makes
     camera angles *(alpha, beta)*:
 
         • alpha  : right-hand deflection ( +y direction)  [rad]
         • beta   : upward deflection   ( +z direction)  [rad]
 
     The ray always points **towards** the black hole, i.e. radially *inward*.
+
+    The FANTASY integrator's Hamiltonian is H = ½ g^{μν} p_μ p_ν, so the momenta
+    it integrates are covariant. For a static observer whose orthonormal frame is
+    e_r̂ = √f ∂_r, e_θ̂ = (1/r) ∂_θ, e_φ̂ = (1/(r sinθ)) ∂_φ with f = 1 − 2M/r, a photon
+    with unit spatial direction (n_r̂, n_θ̂, n_φ̂) has
+
+        p_r = n_r̂ / √f,   p_θ = r n_θ̂,   p_φ = r sinθ n_φ̂.
+
+    (An earlier version used the contravariant p^r = n_r̂ √f next to the covariant
+    p_θ, p_φ, which stretched every ray's angle from the optical axis by 1/f and
+    shrank the shadow by 6.6 % at r = 30M.)
 
     Parameters
     ----------
@@ -162,8 +174,8 @@ def angles_to_p_sph(alpha, beta, r_obs, *, mass_bh=1.0, normalise=True):
     r_obs : float
         Observer radius (distance from BH).
     normalise : bool, default True
-        If *True* the returned vector is normalised such that the orthonormal
-        3-vector has unit length.  Set *False* to keep the raw components.
+        If *True* return the covariant components above. If *False* return the
+        orthonormal-frame components (n_r̂, n_θ̂, n_φ̂) themselves.
     """
 
     # 1) orthonormal components (r̂, θ̂, φ̂) at the observer
@@ -171,25 +183,13 @@ def angles_to_p_sph(alpha, beta, r_obs, *, mass_bh=1.0, normalise=True):
     n_phhat =  math.sin(alpha) * math.cos(beta)   # +y
     n_thhat = -math.sin(beta)                     # –z (θ̂)
 
+    if not normalise:
+        return np.array([n_rhat, n_thhat, n_phhat])
 
+    # 2) covariant components (θ = π/2, so r sinθ = r)
+    f_sqrt = np.sqrt(1.0 - 2.0 * mass_bh / r_obs)   # √f = √(-g_tt) = 1/√g_rr
+    p_r  = n_rhat / f_sqrt      # p_r = g_rr p^r = n_r̂ / √f
+    p_th = n_thhat * r_obs      # p_θ = r² p^θ = r n_θ̂
+    p_ph = n_phhat * r_obs      # p_φ = r² sin²θ p^φ = r sinθ n_φ̂
 
-
-    # 2) optional normalisation
-    if normalise:
-        f_r   = np.sqrt(1.0 - 2.0 * mass_bh / r_obs)      # √g_rr  (with G=c=1)
-        f_ang = r_obs                               # r
-        # at θ = π/2, r sinθ = r
-
-        p_r  = n_rhat  * f_r       # divide by √g_rr
-        p_th = n_thhat * f_ang     # divide by r
-        p_ph = n_phhat * f_ang     # divide by r (equator)
-       
-        # p_r = n_rhat / r_obs
-        # p_th = n_thhat
-        # p_ph = n_phhat
-
-
-
-
-
-    return np.array([p_r, p_th, p_ph]) 
+    return np.array([p_r, p_th, p_ph])

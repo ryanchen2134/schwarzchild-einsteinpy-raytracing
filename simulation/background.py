@@ -6,15 +6,17 @@ import random
 from tqdm import tqdm
 
 def _in_phi_patch(phi, phi0, phi1):
-    """Return True if phi is within [phi0, phi1] on the circle, handling wrapping."""
-    # Normalize to [0, 2pi)
-    phi = phi % (2 * np.pi)
-    phi0 = phi0 % (2 * np.pi)
-    phi1 = phi1 % (2 * np.pi)
-    if phi0 <= phi1:
-        return phi0 <= phi <= phi1
-    else:
-        return phi >= phi0 or phi <= phi1
+    """Return True if phi lies on the counter-clockwise arc from phi0 to phi1.
+
+    A full-circle patch (phi1 - phi0 a multiple of 2*pi, as for the default
+    360-degree background) contains every phi. The previous interval test
+    reduced phi0 and phi1 modulo 2*pi first, so a 360-degree patch degenerated
+    to the single value phi == phi0 and the no-gravity image came out black.
+    """
+    span = (phi1 - phi0) % (2 * np.pi)
+    if span == 0.0:
+        return True
+    return (phi - phi0) % (2 * np.pi) <= span
 
 def save_no_gravity_image_with_background(
     observer, bg_path, out_path, boundary_radius=None,
@@ -41,9 +43,12 @@ def save_no_gravity_image_with_background(
     up_guess = np.array([0, 0, 1])
     if np.allclose(np.cross(optical_axis, up_guess), 0):
         up_guess = np.array([0, 1, 0])
-    right = np.cross(up_guess, optical_axis)
+    # Same basis as the curved renderer (raytracing.py): for the observer on +x this
+    # gives right = +y, up = +z. (cross(up_guess, optical_axis) gave right = -y and
+    # mirrored the no-gravity image.)
+    right = np.cross(optical_axis, up_guess)
     right = right / np.linalg.norm(right)
-    up_vec = np.cross(optical_axis, right)
+    up_vec = np.cross(right, optical_axis)
     up_vec = up_vec / np.linalg.norm(up_vec)
     fov = observer.fov
     plane_dist = 0.2 * np.linalg.norm(obs_pos)

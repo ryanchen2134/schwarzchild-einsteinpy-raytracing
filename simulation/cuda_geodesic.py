@@ -429,11 +429,11 @@ def _metric_derivative(q, rs, wrt, gprime):
             gprime[a, b] = 0.0
     inv_fac = 1.0 - rs / r
     if wrt == 1:  # derivative w.r.t r
-        # d g^{tt}/dr = 2 / (r - rs)^2
+        # g^{tt} = -r/(r - rs)  =>  d g^{tt}/dr = rs / (r - rs)^2
         denom = (r - rs)
-        gprime[0, 0] = 2.0 / (denom * denom)
-        # d g^{rr}/dr = 2/r^2
-        gprime[1, 1] = 2.0 / (r * r)
+        gprime[0, 0] = rs / (denom * denom)
+        # g^{rr} = 1 - rs/r  =>  d g^{rr}/dr = rs / r^2
+        gprime[1, 1] = rs / (r * r)
         # d g^{θθ}/dr = -2 / r^3
         gprime[2, 2] = -2.0 / (r * r * r)
         # d g^{φφ}/dr = -2 /(r^3 sin^2 θ)
@@ -598,28 +598,62 @@ def fantasy_integrate_batch_ord2_full(q0s, p0s, steps, delta, rs, r_max, omega, 
 
 # ------------------------- Wrapper class overwrite ---------------------------
 
+# Schwarzschild radius in the units the kernels run in (lengths in units of M).
+_RS_UNIT = 2.0
+
+
 class CUDASchwarzschildIntegrator:
-    """GPU Fantasy order-2 symplectic integrator for null geodesics."""
+    """GPU Fantasy order-2 symplectic integrator for null geodesics.
+
+    FANTASY's mixing flow rotates (q1 - q2, p1 - p2) by a single angle 2*omega*delta,
+    which mixes components of different dimension (t, r, p_theta, p_phi carry one power
+    of length; theta, phi, p_t, p_r none), so the scheme is only well defined in one
+    unit of length. Every batch is therefore rescaled to units of M (r_s = 2) before
+    the kernel runs and scaled back afterwards: a black hole of any mass integrates
+    exactly the M = 1 scheme. In those units the coupling angle per step is
+    2*omega*delta/M. (Without the rescaling the coupling grew as omega*M**2 and
+    masses above ~2.5 at the default omega produced captured "escapers".)
+
+    `delta` and `r_max` are in the same length unit as the input radii.
+    """
 
     def __init__(self, steps=500, delta=0.2, mass=1.0, omega=1.0, r_max=1e6):
         self.steps = steps
         self.delta = delta
+        self.mass = mass
         self.rs = 2.0 * mass
         self.omega = omega
         self.r_max = r_max
 
+    def _to_units_of_m(self, q0s, p0s):
+        q = np.array(q0s, dtype=np.float64, copy=True)
+        p = np.array(p0s, dtype=np.float64, copy=True)
+        q[:, 0] /= self.mass
+        q[:, 1] /= self.mass
+        p[:, 2] /= self.mass
+        p[:, 3] /= self.mass
+        return q, p
+
     def integrate_batch(self, q0s, p0s):
-        n = q0s.shape[0]
+        q, p = self._to_units_of_m(q0s, p0s)
+        n = q.shape[0]
         out_qs = np.zeros((n, 4), dtype=np.float64)
         threads = 32
         blocks = (n + threads - 1) // threads
-        fantasy_integrate_batch_ord2[blocks, threads](q0s, p0s, self.steps, self.delta, self.rs, self.r_max, self.omega, out_qs)
+        fantasy_integrate_batch_ord2[blocks, threads](
+            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega, out_qs)
+        out_qs[:, 0] *= self.mass
+        out_qs[:, 1] *= self.mass
         return out_qs, None
 
     def integrate_batch_full(self, q0s, p0s):
-        n = q0s.shape[0]
+        q, p = self._to_units_of_m(q0s, p0s)
+        n = q.shape[0]
         out_qs_traj = np.zeros((n, self.steps, 4), dtype=np.float64)
         threads = 32
         blocks = (n + threads - 1) // threads
-        fantasy_integrate_batch_ord2_full[blocks, threads](q0s, p0s, self.steps, self.delta, self.rs, self.r_max, self.omega, out_qs_traj)
-        return out_qs_traj 
+        fantasy_integrate_batch_ord2_full[blocks, threads](
+            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega, out_qs_traj)
+        out_qs_traj[:, :, 0] *= self.mass
+        out_qs_traj[:, :, 1] *= self.mass
+        return out_qs_traj
