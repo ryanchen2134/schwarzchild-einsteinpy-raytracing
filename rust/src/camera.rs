@@ -301,6 +301,45 @@ mod tests {
         assert_eq!(hole_pixel(&edge), (10, 20));
     }
 
+    /// Intrinsic order, with hand-computed expectations (not from `rotation_matrix`):
+    /// pitch acts about the yawed right axis, and roll never moves the optical axis.
+    #[test]
+    fn rotations_compose_in_the_documented_order() {
+        let cam = |y: f64, p: f64, r: f64| {
+            Camera::with_rotation([30.0, 0.0, 0.0], 1.0, 4, 4, y, p, r).unwrap()
+        };
+        let close = |a: Vec3, b: Vec3| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-15);
+        let (s20, c20) = 20f64.to_radians().sin_cos();
+        // Yaw 90° looks along −ŷ with right = −x̂; pitch 20° about that right axis tilts
+        // the view up: (0, −cos 20°, sin 20°). (Extrinsic order would give (0, −1, 0).)
+        let a = cam(FRAC_PI_2, 20f64.to_radians(), 0.0);
+        assert!(
+            close(a.optical_axis, [0.0, -c20, s20]),
+            "{:?}",
+            a.optical_axis
+        );
+        // Yaw 90°, roll 30°: the axis stays −ŷ; up turns from +ẑ towards the yawed
+        // right, −x̂ (the camera rolls clockwise, so the image turns counter-clockwise).
+        let (s30, c30) = 30f64.to_radians().sin_cos();
+        let b = cam(FRAC_PI_2, 0.0, 30f64.to_radians());
+        assert!(
+            close(b.optical_axis, [0.0, -1.0, 0.0]),
+            "{:?}",
+            b.optical_axis
+        );
+        assert!(close(b.up, [-s30, 0.0, c30]), "{:?}", b.up);
+        // Pitch 20° then roll 90°: up becomes the pitched camera's right, +ŷ, and right
+        // becomes the pitched camera's −up, −(sin 20°, 0, cos 20°).
+        let c = cam(0.0, 20f64.to_radians(), FRAC_PI_2);
+        assert!(
+            close(c.optical_axis, [-c20, 0.0, s20]),
+            "{:?}",
+            c.optical_axis
+        );
+        assert!(close(c.up, [0.0, 1.0, 0.0]), "{:?}", c.up);
+        assert!(close(c.right, [-s20, 0.0, -c20]), "{:?}", c.right);
+    }
+
     #[test]
     fn roll_by_a_right_angle_permutes_the_pixels() {
         let fov = 60f64.to_radians();

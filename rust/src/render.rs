@@ -13,7 +13,7 @@ use crate::schwarzschild::BlackHole;
 use crate::shading::{shade, Scene, ShadedRay};
 use crate::sky_patch::SkyPatch;
 use crate::texture::{Rgb, Texture};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use rayon::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -120,6 +120,19 @@ where
     let bh = cfg.black_hole;
     let rs = bh.rs();
     let n = cam.n_pixels();
+    if let Some(d) = &cfg.disk {
+        // The integrators do not check the first step for a crossing (integrator.rs,
+        // "Disk crossings"); that is only safe when the disk ends a step inside the
+        // observer.
+        ensure!(
+            d.r_out < cam.observer_radius() - cfg.integrator.delta,
+            "the disk's outer radius ({}) must lie more than one step (delta = {}) inside the \
+             observer distance ({}): crossings during the first step are not checked",
+            d.r_out,
+            cfg.integrator.delta,
+            cam.observer_radius()
+        );
+    }
 
     let inits: Vec<RayInit> = (0..n)
         .into_par_iter()
@@ -272,6 +285,20 @@ mod tests {
             );
             assert_eq!(a.result.plane_crossings, b.result.plane_crossings);
         }
+    }
+
+    #[test]
+    fn a_disk_reaching_within_one_step_of_the_observer_is_refused() {
+        // The first step is not checked for a crossing (integrator.rs, "Disk
+        // crossings"), so the disk must end more than one step inside the observer.
+        let mut cfg = config(3, vec![]);
+        cfg.disk = Some(Disk::new([1.0, 0.0, 0.0], 6.0, 29.995, 6000.0, 1.0, 30.0).unwrap());
+        let err = render_curved(&cfg, None, &CpuExact, || {})
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("more than one step"), "{err}");
+        cfg.disk = Some(Disk::new([1.0, 0.0, 0.0], 6.0, 29.98, 6000.0, 1.0, 30.0).unwrap());
+        assert!(render_curved(&cfg, None, &CpuExact, || {}).is_ok());
     }
 
     #[test]

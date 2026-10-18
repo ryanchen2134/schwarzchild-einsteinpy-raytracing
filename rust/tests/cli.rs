@@ -190,6 +190,106 @@ fn exact_and_simd_backends_agree() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Every disk row of `photon_data.csv` is consistent with the image and the scene:
+/// the hit lies on the disk plane at `disk_r` inside the band, `disk_temp` is a
+/// temperature of this disk, `disk_phi` and `disk_g` are finite, the pixel is drawn
+/// (neither black nor the red of a numerical error), and the summary counts match.
+fn check_disk_outputs(
+    out: &Path,
+    o: &Output,
+    (incl, azim): (f64, f64),
+    (r_in, r_out): (f64, f64),
+    t_peak: f64,
+) {
+    let n = schwarzschild_rt::disk::Disk::normal_from_angles(incl.to_radians(), azim.to_radians());
+    let csv = std::fs::read_to_string(out.join("photon_data.csv")).unwrap();
+    let header: Vec<&str> = csv.lines().next().unwrap().split(',').collect();
+    assert_eq!(
+        &header[header.len() - 8..],
+        [
+            "disk_r",
+            "disk_phi",
+            "disk_x",
+            "disk_y",
+            "disk_z",
+            "disk_g",
+            "disk_temp",
+            "plane_crossings"
+        ]
+    );
+    let col = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    let img = image::open(out.join("manual_output.png"))
+        .unwrap()
+        .to_rgb8();
+    let size = img.height() as usize;
+    let mut disk_rows = 0;
+    let mut red = 0;
+    for line in csv.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        let num = |name: &str| f[col(name)].parse::<f64>().unwrap();
+        let (i, j) = (
+            f[col("i")].parse::<usize>().unwrap(),
+            f[col("j")].parse::<usize>().unwrap(),
+        );
+        // Row i counts from the bottom; the PNG's row 0 is the top.
+        let px = img.get_pixel(j as u32, (size - 1 - i) as u32).0;
+        if px == [255, 0, 0] {
+            red += 1;
+        }
+        if f[col("collision")] == "disk" {
+            disk_rows += 1;
+            let (r, x, y, z) = (num("disk_r"), num("disk_x"), num("disk_y"), num("disk_z"));
+            assert!((r_in..=r_out).contains(&r), "{line}");
+            assert!(
+                ((x * x + y * y + z * z).sqrt() - r).abs() < 1e-9 * r,
+                "{line}"
+            );
+            assert!(
+                (n[0] * x + n[1] * y + n[2] * z).abs() < 1e-9 * r,
+                "on the plane: {line}"
+            );
+            assert!(num("disk_phi").is_finite());
+            let g = num("disk_g");
+            assert!(g > 0.0 && g.is_finite(), "{line}");
+            let t = num("disk_temp");
+            assert!(t > 0.0 && t <= t_peak * (1.0 + 1e-12), "{line}");
+            assert!(f[col("plane_crossings")].parse::<u32>().unwrap() >= 1);
+            assert_eq!(f[col("exit")], "disk");
+            assert!(
+                px != [0, 0, 0] && px != [255, 0, 0],
+                "pixel ({i},{j}) = {px:?}"
+            );
+        } else {
+            for c in [
+                "disk_r",
+                "disk_phi",
+                "disk_x",
+                "disk_y",
+                "disk_z",
+                "disk_g",
+                "disk_temp",
+            ] {
+                assert_eq!(f[col(c)], "nan", "{line}");
+            }
+        }
+    }
+    assert!(disk_rows > 10, "{disk_rows} disk rows\n{csv}");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains(&format!("Hit disk:         {disk_rows}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Numerical error:  {red}")),
+        "{stdout}"
+    );
+    let flat = image::open(out.join("no_gravity.png")).unwrap().to_rgb8();
+    assert!(
+        flat.pixels().any(|p| p.0 != [0, 0, 0]),
+        "the reference render draws the disk too"
+    );
+}
+
 #[test]
 fn disk_and_pointing_flags_render_and_are_reported() {
     let dir = tmp("disk");
@@ -220,48 +320,38 @@ fn disk_and_pointing_flags_render_and_are_reported() {
         err.contains("disk inclination 60°, azimuth 20°, r 6–20, T_peak 5000 K"),
         "{err}"
     );
-    let csv = std::fs::read_to_string(out.join("photon_data.csv")).unwrap();
-    let header: Vec<&str> = csv.lines().next().unwrap().split(',').collect();
-    let col = |name: &str| header.iter().position(|h| *h == name).unwrap();
-    let (c_coll, c_r, c_g, c_x, c_cross) = (
-        col("collision"),
-        col("disk_r"),
-        col("disk_g"),
-        col("disk_x"),
-        col("plane_crossings"),
+    check_disk_outputs(&out, &o, (60.0, 20.0), (6.0, 20.0), 5000.0);
+    // The same scene at M = 2 with every length doubled.
+    let out2 = dir.join("out2");
+    let o2 = run_sized(
+        &out2,
+        "12",
+        &[
+            "--disk",
+            "--disk-inclination",
+            "60",
+            "--disk-azimuth",
+            "20",
+            "--disk-temperature",
+            "5000",
+            "--yaw",
+            "4",
+            "--pitch",
+            "-3",
+            "--roll",
+            "10",
+            "--bh-mass",
+            "2",
+            "--observer-distance",
+            "60",
+            "--boundary-radius",
+            "62",
+            "--delta",
+            "0.02",
+        ],
     );
-    let mut disk_rows = 0;
-    for line in csv.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        if f[c_coll] == "disk" {
-            disk_rows += 1;
-            let r: f64 = f[c_r].parse().unwrap();
-            let g: f64 = f[c_g].parse().unwrap();
-            let _x: f64 = f[c_x].parse().unwrap();
-            assert!(
-                (6.0..=20.0).contains(&r) && g > 0.0 && g.is_finite(),
-                "{line}"
-            );
-            assert!(f[c_cross].parse::<u32>().unwrap() >= 1);
-        } else {
-            assert_eq!(f[c_r], "nan");
-        }
-    }
-    assert!(disk_rows > 10, "{disk_rows} disk rows\n{csv}");
-    let stdout = String::from_utf8_lossy(&o.stdout);
-    assert!(
-        stdout.contains(&format!("Hit disk:         {disk_rows}")),
-        "{stdout}"
-    );
-    let img = image::open(out.join("manual_output.png"))
-        .unwrap()
-        .to_rgb8();
-    assert!(img.pixels().filter(|p| p.0 != [0, 0, 0]).count() >= disk_rows);
-    let flat = image::open(out.join("no_gravity.png")).unwrap().to_rgb8();
-    assert!(
-        flat.pixels().any(|p| p.0 != [0, 0, 0]),
-        "the reference render draws the disk too"
-    );
+    assert!(o2.status.success(), "{}", stderr(&o2));
+    check_disk_outputs(&out2, &o2, (60.0, 20.0), (12.0, 40.0), 5000.0);
     // Bad disk and pointing flags fail with a message naming the problem.
     for (args, needle) in [
         (vec!["--disk", "--disk-inner", "5"], "inner radius"),

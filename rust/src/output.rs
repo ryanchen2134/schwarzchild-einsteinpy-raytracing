@@ -36,8 +36,10 @@ pub fn write_png(path: &Path, width: usize, height: usize, pixels: &[Rgb]) -> Re
 /// Disk columns: `disk_r`, `disk_phi` (hit radius and azimuth in the ray's rotated
 /// frame), `disk_x, disk_y, disk_z` (lab-frame hit position), `disk_g` (observed over
 /// emitted frequency), `disk_temp` (effective temperature at the hit, kelvin), all
-/// `nan` unless the ray ended on the disk; `plane_crossings` counts every crossing of
-/// the disk plane, the hit included (0 without a disk).
+/// `nan` unless the ray ended on the disk (`exit = disk`; its collision is `disk`, or
+/// `numerical error` when the redshift fails the `1 − Ω b_z > 0` check);
+/// `plane_crossings` counts every crossing of the disk plane, the hit included (0
+/// without a disk).
 pub fn write_photon_csv(path: &Path, photons: &[PhotonRecord]) -> Result<()> {
     let mut w = BufWriter::new(
         File::create(path).with_context(|| format!("cannot create {}", path.display()))?,

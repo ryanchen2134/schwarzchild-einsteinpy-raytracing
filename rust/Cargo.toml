@@ -3,7 +3,7 @@ name = "schwarzschild-rt"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
-description = "Schwarzschild null-geodesic ray tracer: FANTASY order-2 symplectic integration on the CPU"
+description = "Schwarzschild null-geodesic ray tracer with a Keplerian accretion disk: FANTASY order-2 symplectic integration on SIMD, scalar and CUDA backends"
 publish = false
 
 [[bin]]

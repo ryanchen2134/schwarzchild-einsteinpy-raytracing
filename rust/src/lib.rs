@@ -4,7 +4,8 @@
 //! into a null covariant 4-momentum → a [`backend::BatchIntegrator`] follows it
 //! with the FANTASY order-2 symplectic scheme ([`integrator`] is the scalar
 //! reference, [`integrator_fast`] the SIMD path, `cuda` the GPU) → [`shading`]
-//! classifies the exit and samples the sky through a [`sky_patch::SkyPatch`] →
+//! classifies the exit and samples the sky through a [`sky_patch::SkyPatch`], or
+//! shades a [`disk::Disk`] hit from its Keplerian redshift →
 //! [`output`] writes the image and CSVs. [`render`] wires the stages together;
 //! [`flat`] is the no-gravity reference.
 //!

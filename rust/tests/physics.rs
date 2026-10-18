@@ -193,20 +193,23 @@ fn pixel_rays_scale_with_mass() {
 
 use schwarzschild_rt::backend::{BatchIntegrator, CpuExact, CpuFast};
 use schwarzschild_rt::camera::Camera;
-use schwarzschild_rt::disk::{keplerian_omega, redshift, Disk};
+use schwarzschild_rt::coords::{cross, dot, mat_vec, norm, normalize, rot_x, Vec3};
+use schwarzschild_rt::disk::{keplerian_omega, Disk};
+use schwarzschild_rt::integrator::{integrate_ray, DiskBand, Ray};
 use schwarzschild_rt::render::{render_curved, RenderConfig, RenderResult};
 use schwarzschild_rt::shading::Collision;
 use schwarzschild_rt::sky_patch::SkyPatch;
 
-fn disk_scene(
+fn disk_scene_at(
+    mass: f64,
     size: usize,
     inclination_deg: f64,
     azimuth_deg: f64,
     (yaw, pitch, roll): (f64, f64, f64),
 ) -> RenderConfig {
-    let bh = BlackHole::new(1.0);
+    let bh = BlackHole::new(mass);
     let camera = Camera::with_rotation(
-        [30.0, 0.0, 0.0],
+        [30.0 * mass, 0.0, 0.0],
         80f64.to_radians(),
         size,
         size,
@@ -219,34 +222,88 @@ fn disk_scene(
     RenderConfig {
         camera,
         black_hole: bh,
-        boundary_radius: 31.0,
+        boundary_radius: 31.0 * mass,
         patch: SkyPatch::full_sky(),
-        integrator: IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, bh.rs()),
-        disk: Some(Disk::new(normal, 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap()),
+        integrator: IntegratorSettings::new(20_000, 0.01 * mass, 0.01, 31.0 * mass, bh.rs()),
+        disk: Some(Disk::new(normal, 6.0 * mass, 20.0 * mass, 6000.0, mass, 30.0 * mass).unwrap()),
         sample_pixels: vec![],
         max_trajectory_points: 10,
     }
+}
+
+fn disk_scene(
+    size: usize,
+    inclination_deg: f64,
+    azimuth_deg: f64,
+    angles: (f64, f64, f64),
+) -> RenderConfig {
+    disk_scene_at(1.0, size, inclination_deg, azimuth_deg, angles)
 }
 
 fn render(cfg: &RenderConfig, backend: &dyn BatchIntegrator) -> RenderResult {
     render_curved(cfg, None, backend, || {}).unwrap()
 }
 
-/// Every disk hit, in every integrator, must give a physical redshift, and `g`
-/// recomputed from the momentum the integrator actually carried to the hit must
-/// agree with the closed form from the conserved initial momenta.
+/// Two renders that are equal only to rounding (different trig arguments, mirrored
+/// pixels) may disagree on the class of a pixel within rounding of a boundary. Such a
+/// flip is tolerated only on a pixel bordering one of a different class in the first
+/// render, and on at most `max` pixels.
+fn check_flips(n: usize, a: &[Collision], b: &[Collision], max: usize, what: &str) {
+    let mut flips = 0;
+    for i in 0..n {
+        for j in 0..n {
+            let k = i * n + j;
+            if a[k] == b[k] {
+                continue;
+            }
+            flips += 1;
+            let on_boundary = (i.saturating_sub(1)..=(i + 1).min(n - 1)).any(|ni| {
+                (j.saturating_sub(1)..=(j + 1).min(n - 1)).any(|nj| a[ni * n + nj] != a[k])
+            });
+            assert!(
+                on_boundary,
+                "{what}: ({i},{j}) is {:?} vs {:?} away from any boundary",
+                a[k], b[k]
+            );
+        }
+    }
+    assert!(flips <= max, "{what}: {flips} flips");
+}
+
+/// Independent truth for `g` (shares no code with `disk.rs`): the emitter moves at the
+/// static-frame speed `v = √(M/(r − 2M))` along `n × x̂` and the photon travels along
+/// the unit vector `k̂`, so `g = √f √(1 − v²) / (√f_obs (1 − v·k̂))`.
+fn kinematic_redshift(mass: f64, r_obs: f64, n: Vec3, x_hit: Vec3, k_hat: Vec3) -> f64 {
+    let r = norm(x_hit);
+    let f = 1.0 - 2.0 * mass / r;
+    let v = (mass / (r - 2.0 * mass)).sqrt();
+    let e_v = normalize(cross(n, x_hit));
+    f.sqrt() * (1.0 - v * v).sqrt()
+        / ((1.0 - 2.0 * mass / r_obs).sqrt() * (1.0 - v * dot(e_v, k_hat)))
+}
+
+/// Every disk hit, in both CPU integrators, has a physical `g`, and that `g` agrees with
+/// the kinematic Doppler + gravitational factor built from the momentum the integrator
+/// actually carried to the hit (the photon is the time reverse of the traced ray) and
+/// the lab-frame normal: this ties the closed form's `b_z` sign, the frame rotation
+/// and the backward-tracing convention to the integrated rays, on an oblique disk.
 #[test]
-fn every_disk_hit_has_a_physical_redshift_that_the_integrated_momentum_confirms() {
+fn every_disk_hit_agrees_with_the_kinematic_redshift_of_its_integrated_photon() {
     let cfg = disk_scene(21, 55.0, 30.0, (6.0, -4.0, 0.0));
     let disk = cfg.disk.as_ref().unwrap();
+    let delta = cfg.integrator.delta;
     for backend in [&CpuExact as &dyn BatchIntegrator, &CpuFast] {
         let res = render(&cfg, backend);
-        let mut hits = 0;
-        let (mut g_min, mut g_max) = (f64::INFINITY, 0.0f64);
+        let (mut hits, mut blue, mut red) = (0, 0, 0);
+        let mut worst = 0.0f64;
         for p in &res.photons {
-            if p.shaded.collision == Collision::NumericalError {
-                panic!("numerical error at ({}, {}): {:?}", p.i, p.j, p.shaded.disk);
-            }
+            assert_ne!(
+                p.shaded.collision,
+                Collision::NumericalError,
+                "({}, {})",
+                p.i,
+                p.j
+            );
             let Some(d) = p.shaded.disk else { continue };
             hits += 1;
             assert_eq!(p.shaded.collision, Collision::Disk);
@@ -257,26 +314,55 @@ fn every_disk_hit_has_a_physical_redshift_that_the_integrated_momentum_confirms(
                 1.0 - keplerian_omega(1.0, d.r) * b_z > 0.0,
                 "1 − Ω b_z must be positive"
             );
-            // Contraction with the momentum at the hit (p_t, p_φ drift at the scheme's
-            // second-order level) against the closed form from the initial momenta.
-            let g_hit = redshift(1.0, d.r, p.result.p[0], p.result.p[3], frame.n_z, 30.0);
+            // The hit lies in the disk plane, in the band, and one step from the state
+            // where the integrator stopped.
+            assert!(dot(disk.normal, d.position).abs() < 1e-9);
+            assert!((6.0..=20.0).contains(&d.r));
+            let q = p.result.q;
+            let stop = mat_vec(
+                &rot_x(p.init.beta),
+                [q[1] * q[3].cos(), q[1] * q[3].sin(), 0.0],
+            );
+            let gap = norm([
+                stop[0] - d.position[0],
+                stop[1] - d.position[1],
+                stop[2] - d.position[2],
+            ]);
+            assert!(gap < 2.0 * delta, "({}, {}): {gap}", p.i, p.j);
+            // Photon direction at the stop: k = −p; static orthonormal components
+            // k^r̂ = √f k_r, k^φ̂ = k_φ / r in the ray frame, rotated to the lab.
+            let f = 1.0 - 2.0 / q[1];
+            let (kr, kph) = (-f.sqrt() * p.result.p[1], -p.result.p[3] / q[1]);
+            let (s, c) = q[3].sin_cos();
+            let k_rot = [kr * c - kph * s, kr * s + kph * c, 0.0];
+            let k_hat = normalize(mat_vec(&rot_x(p.init.beta), k_rot));
+            let g_kin = kinematic_redshift(1.0, 30.0, disk.normal, d.position, k_hat);
+            let rel = (g_kin - d.g).abs() / d.g;
             assert!(
-                (g_hit - d.g).abs() < 1e-4 * d.g,
-                "({}, {}): {g_hit} vs {}",
+                rel < 2e-3,
+                "({}, {}): kinematic {g_kin} vs closed form {}",
                 p.i,
                 p.j,
                 d.g
             );
-            // The hit lies in the disk plane and in the band.
-            assert!(schwarzschild_rt::coords::dot(disk.normal, d.position).abs() < 1e-9);
-            assert!((6.0..=20.0).contains(&d.r));
-            g_min = g_min.min(d.g);
-            g_max = g_max.max(d.g);
+            worst = worst.max(rel);
+            // Doppler both ways, measured against the gravitational value at that radius.
+            let g0 = (1.0 - 3.0 / d.r).sqrt() / (1.0 - 2.0 / 30.0f64).sqrt();
+            if d.g > 1.05 * g0 {
+                blue += 1;
+            }
+            if d.g < 0.95 * g0 {
+                red += 1;
+            }
         }
+        eprintln!(
+            "{}: {hits} hits, {blue} blueshifted, {red} redshifted, worst kinematic Δg/g {worst:e}",
+            backend.name()
+        );
         assert!(hits > 60, "{hits} hits with {}", backend.name());
         assert!(
-            g_max > 1.0 && g_min < 0.9,
-            "Doppler both ways: g in [{g_min}, {g_max}]"
+            blue > 5 && red > 5,
+            "Doppler both ways: {blue} blue, {red} red"
         );
     }
 }
@@ -288,12 +374,16 @@ fn reversing_the_disk_normal_mirrors_the_image() {
     let n = 21;
     let a = render(&disk_scene(n, 90.0, 0.0, (0.0, 0.0, 0.0)), &CpuExact);
     let b = render(&disk_scene(n, 90.0, 180.0, (0.0, 0.0, 0.0)), &CpuExact);
+    let mirrored: Vec<_> = (0..n * n)
+        .map(|k| b.photons[(k / n) * n + (n - 1 - k % n)].shaded.collision)
+        .collect();
+    let classes: Vec<_> = a.photons.iter().map(|p| p.shaded.collision).collect();
+    check_flips(n, &classes, &mirrored, 2, "mirror");
     let mut compared = 0;
     for i in 0..n {
         for j in 0..n {
             let pa = &a.photons[i * n + j];
             let pb = &b.photons[i * n + (n - 1 - j)];
-            assert_eq!(pa.shaded.collision, pb.shaded.collision, "({i},{j})");
             if let (Some(da), Some(db)) = (pa.shaded.disk, pb.shaded.disk) {
                 assert!(
                     (da.r - db.r).abs() < 1e-9 && (da.g - db.g).abs() < 1e-9,
@@ -330,13 +420,11 @@ fn disk_azimuth_and_camera_roll_are_the_same_rotation() {
     let n = 21;
     let a = render(&disk_scene(n, 55.0, 30.0, (0.0, 0.0, 0.0)), &CpuFast);
     let b = render(&disk_scene(n, 55.0, 0.0, (0.0, 0.0, 30.0)), &CpuFast);
+    let ca: Vec<_> = a.photons.iter().map(|p| p.shaded.collision).collect();
+    let cb: Vec<_> = b.photons.iter().map(|p| p.shaded.collision).collect();
+    check_flips(n, &ca, &cb, 2, "roll");
     let mut compared = 0;
     for (pa, pb) in a.photons.iter().zip(&b.photons) {
-        assert_eq!(
-            pa.shaded.collision, pb.shaded.collision,
-            "({}, {})",
-            pa.i, pa.j
-        );
         if let (Some(da), Some(db)) = (pa.shaded.disk, pb.shaded.disk) {
             assert!(
                 (da.r - db.r).abs() < 1e-9 && (da.g - db.g).abs() < 1e-9,
@@ -348,45 +436,110 @@ fn disk_azimuth_and_camera_roll_are_the_same_rotation() {
         }
     }
     assert!(compared > 60, "{compared}");
-    // The rotation is not a no-op: azimuth 30 differs from azimuth 0 unrolled.
-    let c = render(&disk_scene(n, 55.0, 0.0, (0.0, 0.0, 0.0)), &CpuFast);
-    assert!(a
+    // The opposite roll is a different picture: the test can see the sign.
+    let wrong = render(&disk_scene(n, 55.0, 0.0, (0.0, 0.0, -30.0)), &CpuFast);
+    let differ = a
         .photons
         .iter()
-        .zip(&c.photons)
-        .any(|(x, y)| x.shaded.collision != y.shaded.collision));
+        .zip(&wrong.photons)
+        .filter(|(x, y)| x.shaded.collision != y.shaded.collision)
+        .count();
+    assert!(differ > 20, "{differ}");
 }
 
-/// Turning the camera moves the hole and the disk together: the pixel directions of a
-/// yawed/pitched camera are the rigid rotation of the unrotated ones, so a rotated render
-/// contains the same scene content as the unrotated render read at the rotated directions.
+/// Turning the camera turns the view, not the scene. A face-on disk is axisymmetric
+/// about the line of sight, so the hit radius of a ray depends only on its angle from
+/// the hole; every hit of a yawed and pitched render must equal the hit of a ray with
+/// the same angle sent in the x–y plane by the unturned pipeline.
 #[test]
 fn a_turned_camera_sees_the_same_scene_from_the_same_place() {
-    // Yaw by exactly the angle of a pixel column in a narrow, finely sampled view is not
-    // a pixel permutation (pinhole tangents), so compare through the closed form instead:
-    // every disk hit in the turned view obeys the same g(r, β, p) relation, and the
-    // hole stays where the camera test says it goes.
     let n = 21;
-    let cfg = disk_scene(n, 0.0, 0.0, (20.0, 0.0, 0.0));
+    let cfg = disk_scene(n, 0.0, 0.0, (20.0, -10.0, 0.0));
+    let disk = cfg.disk.as_ref().unwrap();
+    let settings = cfg.integrator.with_disk(DiskBand {
+        r_in: 6.0,
+        r_out: 20.0,
+    });
     let res = render(&cfg, &CpuExact);
-    let captured: Vec<(usize, usize)> = res
+    let hole: Vec<(usize, usize)> = res
         .photons
         .iter()
         .filter(|p| p.shaded.collision == Collision::BlackHole)
         .map(|p| (p.i, p.j))
         .collect();
-    assert!(!captured.is_empty());
+    assert!(!hole.is_empty());
+    let mean = |pick: fn(&(usize, usize)) -> usize| {
+        hole.iter().map(pick).sum::<usize>() as f64 / hole.len() as f64
+    };
+    let (hole_row, hole_col) = (mean(|p| p.0), mean(|p| p.1));
     assert!(
-        captured.iter().all(|&(_, j)| j > n / 2),
-        "yaw left moves the hole right: {captured:?}"
+        hole_col > 12.0 && hole_row > 11.0,
+        "yaw left and pitch down put the hole right of and above the centre: {hole:?}"
     );
+    let (mut hits, mut left, mut right, mut mismatched) = (0, 0, 0, 0);
     for p in &res.photons {
-        if let Some(d) = p.shaded.disk {
-            let expect = (1.0 - 3.0 / d.r).sqrt() / (1.0 - 2.0 / 30.0f64).sqrt();
-            assert!(
-                (d.g - expect).abs() < 1e-14,
-                "face-on g is pointing-independent"
-            );
+        let a = p.init.alpha0;
+        let flat = initial_conditions([30.0, 0.0, 0.0], [30.0 - a.cos(), a.sin(), 0.0], 1.0);
+        assert!((flat.alpha0 - a).abs() < 1e-14);
+        let ray = Ray::with_disk(flat.q0, flat.p0, disk.ray_frame(flat.beta).phi_d);
+        let r = integrate_ray(&ray, 2.0, &settings);
+        match (p.shaded.disk, r.disk_hit) {
+            (Some(d), Some(h)) => {
+                assert!(
+                    (d.r - h.r).abs() < 1e-9,
+                    "({}, {}): {} vs {}",
+                    p.i,
+                    p.j,
+                    d.r,
+                    h.r
+                );
+                hits += 1;
+                if (p.j as f64) < hole_col {
+                    left += 1
+                } else if (p.j as f64) > hole_col {
+                    right += 1
+                }
+            }
+            (None, None) => assert_eq!(p.result.exit, r.exit, "({}, {})", p.i, p.j),
+            _ => mismatched += 1,
         }
     }
+    assert!(
+        mismatched <= 1,
+        "{mismatched} pixels classified differently"
+    );
+    assert!(
+        hits > 40 && left > 5 && right > 5,
+        "{hits} hits, {left} left and {right} right of the hole"
+    );
+}
+
+/// The whole disk render is scale invariant: at M = 2 (observer, boundary, band and
+/// step doubled) every pixel reproduces M = 1 bit for bit, lengths doubled. Exercises
+/// the mass rescaling of the band and the hit, and the shading at a physical r_obs.
+#[test]
+fn the_disk_render_is_scale_invariant() {
+    let n = 15;
+    let angles = (6.0, -4.0, 10.0);
+    let a = render(&disk_scene_at(1.0, n, 55.0, 30.0, angles), &CpuFast);
+    let b = render(&disk_scene_at(2.0, n, 55.0, 30.0, angles), &CpuFast);
+    let mut hits = 0;
+    for (pa, pb) in a.photons.iter().zip(&b.photons) {
+        assert_eq!(pa.shaded.collision, pb.shaded.collision);
+        assert_eq!(pa.result.exit, pb.result.exit);
+        assert_eq!(pa.result.plane_crossings, pb.result.plane_crossings);
+        assert_eq!(pa.shaded.colour, pb.shaded.colour);
+        assert_eq!((2.0 * pa.result.q[1]).to_bits(), pb.result.q[1].to_bits());
+        if let (Some(da), Some(db)) = (pa.shaded.disk, pb.shaded.disk) {
+            assert_eq!((2.0 * da.r).to_bits(), db.r.to_bits());
+            assert_eq!(da.phi.to_bits(), db.phi.to_bits());
+            assert_eq!(da.g.to_bits(), db.g.to_bits(), "g is dimensionless");
+            assert_eq!(da.temperature.to_bits(), db.temperature.to_bits());
+            for k in 0..3 {
+                assert_eq!((2.0 * da.position[k]).to_bits(), db.position[k].to_bits());
+            }
+            hits += 1;
+        }
+    }
+    assert!(hits > 30, "{hits}");
 }

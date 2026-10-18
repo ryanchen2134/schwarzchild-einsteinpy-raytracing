@@ -137,22 +137,25 @@ struct Args {
     disk: bool,
     /// Angle in degrees between the disk normal and the observer's position vector +x:
     /// 0 face-on, 90 edge-on, 180 face-on with the opposite sense of rotation. Measured
-    /// against the observer's position, not the optical axis.
+    /// against the observer's position, not the optical axis. Only with --disk.
     #[arg(long, default_value_t = 75.0)]
     disk_inclination: f64,
-    /// Right-handed rotation of the disk normal about +x, in degrees. At 0 the near side
-    /// of an inclined disk is below the black hole and, edge-on, the left side approaches.
+    /// Right-handed rotation of the disk normal about +x, in degrees. At 0 a disk inclined
+    /// by less than 90 degrees has its near side below the black hole (above for 90-180)
+    /// and, edge-on, the left side approaches. Only with --disk.
     #[arg(long, default_value_t = 0.0)]
     disk_azimuth: f64,
     /// Inner radius of the disk, in the same length unit as the other radii. Defaults to
-    /// the ISCO, 6M, and may not be smaller.
+    /// the ISCO, 6M, and may not be smaller. Only with --disk.
     #[arg(long)]
     disk_inner: Option<f64>,
-    /// Outer radius of the disk (default 20M); must stay below --observer-distance.
+    /// Outer radius of the disk (default 20M); must lie more than one step (--delta)
+    /// inside --observer-distance, so with --bh-mass 1.5 or more and the default
+    /// observer distance pass it or a larger --observer-distance. Only with --disk.
     #[arg(long)]
     disk_outer: Option<f64>,
     /// Peak effective temperature of the disk in kelvin. A false-colour parameter: it
-    /// sets the hue, not the physics.
+    /// sets the hue, not the physics. Only with --disk.
     #[arg(long, default_value_t = 6000.0)]
     disk_temperature: f64,
 }
@@ -178,7 +181,22 @@ fn build_disk(args: &Args) -> Result<Option<Disk>> {
     );
     let r_in = args.disk_inner.unwrap_or(6.0 * args.bh_mass);
     let r_out = args.disk_outer.unwrap_or(20.0 * args.bh_mass);
-    Disk::new(
+    let used = || {
+        format!(
+            "--disk: inner radius {r_in}{}, outer radius {r_out}{}",
+            if args.disk_inner.is_none() {
+                " (default 6M)"
+            } else {
+                ""
+            },
+            if args.disk_outer.is_none() {
+                " (default 20M)"
+            } else {
+                ""
+            },
+        )
+    };
+    let disk = Disk::new(
         normal,
         r_in,
         r_out,
@@ -186,8 +204,16 @@ fn build_disk(args: &Args) -> Result<Option<Disk>> {
         args.bh_mass,
         args.observer_distance,
     )
-    .map(Some)
-    .context("--disk-inner / --disk-outer / --disk-temperature")
+    .with_context(used)?;
+    ensure!(
+        r_out < args.observer_distance - args.delta,
+        "{}: --disk-outer must lie more than one step (--delta {}) inside --observer-distance \
+         ({}); pass a smaller --disk-outer or a larger --observer-distance",
+        used(),
+        args.delta,
+        args.observer_distance
+    );
+    Ok(Some(disk))
 }
 
 fn validate(args: &Args) -> Result<()> {
@@ -540,6 +566,9 @@ mod tests {
         for bad in [
             vec!["--disk", "--disk-inner", "5.9"],
             vec!["--disk", "--disk-outer", "30"],
+            vec!["--disk", "--disk-outer", "29.995"],
+            vec!["--disk", "--disk-outer", "29.5", "--delta", "0.6"],
+            vec!["--disk", "--bh-mass", "1.5"],
             vec!["--disk", "--disk-inner", "10", "--disk-outer", "10"],
             vec!["--disk", "--disk-temperature", "0"],
             vec!["--disk", "--disk-inclination", "181"],
@@ -553,6 +582,23 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+        // The message names the radii used and which were defaults.
+        let err = format!(
+            "{:#}",
+            validate(&parse(&["--disk", "--bh-mass", "2"])).unwrap_err()
+        );
+        assert!(
+            err.contains("outer radius 40 (default 20M)") && err.contains("observer distance (30)"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            validate(&parse(&["--disk", "--disk-outer", "29.995"])).unwrap_err()
+        );
+        assert!(
+            err.contains("--delta 0.01") && err.contains("outer radius 29.995:"),
+            "{err}"
+        );
         // Without --disk the disk flags are inert.
         assert!(validate(&parse(&["--disk-inner", "1"])).is_ok());
     }

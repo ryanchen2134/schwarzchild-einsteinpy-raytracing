@@ -114,8 +114,9 @@ through and are counted.
 **Geometry.** The plane is `n · x = 0`. `--disk-inclination` is the angle between
 `n` and the observer's position vector `+x̂` (0 face-on, 90 edge-on, 180 face-on with
 the opposite sense of rotation); `--disk-azimuth` turns `n` right-handedly about
-`+x̂`: `n = R_x(azimuth) · (cos i, 0, sin i)`. At azimuth 0 an inclined disk's near
-side is below the hole in the image and its far side above. Both angles are measured
+`+x̂`: `n = R_x(azimuth) · (cos i, 0, sin i)`. At azimuth 0 a disk inclined by less
+than 90° has its near side below the hole in the image and its far side above; between
+90° and 180° the near side is above. Both angles are measured
 against the observer's position, not the optical axis, so pointing the camera does
 not move the disk. The material orbits right-handedly about `n`: at `x` it moves along
 `n × x̂`. Edge-on at azimuth 0 (`n = +ẑ`) the material at `(0, −r, 0)`, on the
@@ -123,7 +124,10 @@ observer's left, moves towards the observer, so the left side approaches and is
 blueshifted. `(i, a) → (180° − i, a + 180°)` reverses the normal and with it the sense
 of rotation. `--disk-inner` defaults to the ISCO `6M` and may not be smaller (no stable
 circular orbits inside it; below `3M` the redshift is undefined); `--disk-outer`
-defaults to `20M` and must stay below `--observer-distance`.
+defaults to `20M` and must lie more than one step (`--delta`) inside
+`--observer-distance` (see *Detection*). The defaults scale with `--bh-mass` but
+`--observer-distance` does not, so with `--bh-mass` 1.5 or more pass `--disk-outer`
+or scale the observer and boundary too. The disk flags are ignored without `--disk`.
 
 **Detection** (`integrator.rs`, "Disk crossings"). Each ray is integrated in a frame
 rotated about `+x̂` by `−β`, where its orbit is the x–y plane and the disk normal is
@@ -131,11 +135,15 @@ rotated about `+x̂` by `−β`, where its orbit is the x–y plane and the disk
 `phi_d = atan2(−n'_x, n'_y)`, so a crossing is a change of exactly one in
 `floor((φ − phi_d)/π)` between consecutive steps (`φ` is never wrapped); the radius
 is interpolated linearly in `φ`. The check runs after every step from the second
-step on (every ray starts at the observer, which lies on the crossing line of an
-edge-on disk) and before the next step's capture/escape test. A ray whose orbit lies
+step on and before the next step's capture/escape test. Every ray starts at the
+observer, which lies on the crossing line of an edge-on disk, where rounding could
+register a crossing at `r_obs`; a null ray moves at most `p_t < 1` in `r` per unit
+affine parameter, so a first-step crossing lies within `δ` of `r_obs`, outside the
+disk because `r_out < r_obs − δ` is enforced. A ray whose orbit lies
 in the disk plane (`|n'_⊥| < 1e-9`) detects nothing. The scalar, SIMD and CUDA
 integrators share this arithmetic operation for operation, so hit radii and azimuths
-are bit-identical between the two CPU paths.
+are bit-identical between the two CPU paths. A hit ends the ray one step past the
+crossing, so `exit = disk` rows report the post-crossing state in `final_r`.
 
 **Redshift.** The physical photon is the time reverse of the traced ray: its energy
 at infinity is `E = p_t`, its angular momentum about `n` is `L_n = −p_φ n'_z`, and
@@ -154,20 +162,24 @@ reported as a numerical error.
 **Emission.** The effective temperature follows the Newtonian Shakura–Sunyaev profile
 with zero torque at the inner edge, `T⁴ ∝ (1 − √(r_in/r))/r³`, peaking at
 `49/36 r_in` with the value of `--disk-temperature`. By Liouville's theorem the
-observed spectrum is a blackbody at `gT`: the pixel's luminance is the tone-mapped
-`(gT/T_peak)⁴` (`1 − exp(−2x)`), its chromaticity that of a blackbody at `gT`
-(Kang et al. 2002 fit, linear sRGB, then gamma-encoded). Nothing is multiplied by
-`g⁴` on top of the blackbody at `gT`. The temperature is a false-colour parameter:
-at realistic disk temperatures every pixel would be white. The no-gravity reference
-draws the disk with straight rays and `g = 1`.
+observed spectrum is a blackbody at `gT`. The pixel's linear luminance is exactly the
+tone-mapped intensity `1 − exp(−(gT/T_peak)⁴)` (0.63 at the peak temperature without
+Doppler shift), so brightness rises monotonically with `g` and the most blueshifted
+material is the brightest; its hue is the chromaticity of a blackbody at `gT` (Kang et
+al. 2002 fit, linear sRGB). A hue too saturated to show at that luminance is mixed with
+grey of the same luminance just enough to fit, so the hottest, brightest spots wash
+out towards white. Nothing is multiplied by `g⁴` on top of the blackbody at `gT`. The
+temperature is a false-colour parameter: at realistic disk temperatures every pixel
+would be white. The no-gravity reference draws the disk with straight rays and
+`g = 1`.
 
 ## Outputs (`--out-dir`, default `output/`)
 
 | File | Content |
 | --- | --- |
-| `manual_output.png` | The lensed image. Row 0 is the top of the image; `up` is `+z`. |
+| `manual_output.png` | The lensed image. Row 0 is the top of the image, the camera's `up` (`+z` when `--pitch` and `--roll` are 0). |
 | `no_gravity.png` | Straight-ray reference through the same camera and sky patch. |
-| `photon_data.csv` | One row per pixel. The first fifteen columns carry the names of the Python table (read them by name); `exit`, `n_steps`, `beta` follow, then `disk_r`, `disk_phi` (hit radius and azimuth in the ray's rotated frame), `disk_x`, `disk_y`, `disk_z` (lab-frame hit position), `disk_g`, `disk_temp` (kelvin), all `nan` unless the ray ended on the disk (`collision = disk`, `exit = disk`), and `plane_crossings`, the number of disk-plane crossings including the hit. `final_th ∈ [0, π]`, `final_ph ∈ (−π, π]` in the lab frame for every row (Python wrote `φ mod 2π`, negated under `--bg-flip-phi`, for escaped rows). `i` counts rows from the bottom. |
+| `photon_data.csv` | One row per pixel. The first fifteen columns carry the names of the Python table (read them by name); `exit`, `n_steps`, `beta` follow, then `disk_r`, `disk_phi` (hit radius and azimuth in the ray's rotated frame), `disk_x`, `disk_y`, `disk_z` (lab-frame hit position), `disk_g`, `disk_temp` (kelvin), all `nan` unless the ray ended on the disk (`exit = disk`; its `collision` is `disk`, or `numerical error` for a hit whose redshift fails the `1 − Ω b_z > 0` check, which only a broken integration can produce), and `plane_crossings`, the number of disk-plane crossings including the hit. `final_th ∈ [0, π]`, `final_ph ∈ (−π, π]` in the lab frame for every row (Python wrote `φ mod 2π`, negated under `--bg-flip-phi`, for escaped rows). `i` counts rows from the bottom. |
 | `sampled_rays.csv` | Lab-frame points of `--n-sample-rays` curved trajectories (`--seed` makes the choice reproducible); `pixel = i·width + j` joins a ray to `photon_data.csv`. |
 | `flat_rays.csv` | The same pixels' straight rays. |
 
@@ -240,19 +252,26 @@ since been ported back into the Python code on `main`.
 
 ## Verification
 
-`cargo test --release` runs five layers:
+`cargo test --release` runs six layers:
 
 - unit tests in each module. `disk.rs` holds the oblique oracle: on a disk at
   inclination 55°, azimuth 30°, the closed-form `g` from `(p_t, p_φ, n'_z)` equals the
   Doppler + gravitational factor computed independently from lab-frame geometry
   (emitter 3-velocity and photon direction in the static frame) to 1e-12 on 200
-  configurations, and fails with the opposite frame rotation; `integrator.rs` checks
-  the crossing detector on a straight line (second-order convergence of the hit
-  radius) and a circle (two crossings per revolution), that edge-on rays register no
-  crossing at the observer, that a last-step crossing is still a hit, and that the
-  disk-off path is unchanged; `integrator_fast.rs` checks hits, azimuths and crossing
-  counts bit-identical to the scalar integrator, with mixed detecting and
-  non-detecting lanes. The other unit tests include the SIMD step against the scalar one
+  configurations, and fails with the opposite frame rotation; it also pins the
+  colour (luminance exactly the tone-mapped intensity and monotone in `g`, no extra
+  `g⁴`, chromaticity against values computed by hand, four pixel values the Python
+  build reproduces) and the quarter power of the temperature profile.
+  `integrator.rs` checks the crossing detector's second-order convergence with the
+  crossing held at a fixed fraction of the step (and that a first-order rule would
+  show), both crossing directions on a spiral, that edge-on rays register no crossing
+  at the observer and that a crossing during the first step is not counted, that a
+  looping ray counts every crossing before its hit, that a last-step crossing is still
+  a hit, and that the disk-off path is unchanged; `integrator_fast.rs` checks hits,
+  azimuths and crossing counts bit-identical to the scalar integrator (with mixed
+  detecting and non-detecting lanes, a hit after an out-of-band crossing, a hit on the
+  last permitted step) and an M = 2 run reproducing M = 1 bit for bit; `camera.rs`
+  pins the yaw → pitch → roll order with hand-computed bases. The other unit tests include the SIMD step against the scalar one
   (`integrator_fast`: bit-identical states, exits and step counts on 169 pipeline
   rays and on one group of four distinct rays, a non-equatorial ray falling back to
   the scalar path, step-limit and last-step crossings, mass rescaling, a NaN and a
@@ -278,18 +297,26 @@ since been ported back into the Python code on `main`.
   decision; none occur), hit radii to 4e-15 relative, hit azimuths to 4e-16 and `g` to
   1e-15 [1e-9]; the whole Rust pipeline from the flags alone gives the same;
 - `tests/physics.rs`: closed-form checks that need no reference implementation,
-  including the disk: every hit in both CPU backends has a physical `g` that the
-  momentum carried to the hit confirms, reversing the normal mirrors the image and
-  flips the Doppler side, a disk at azimuth `α` seen unrolled equals the disk at
-  azimuth 0 seen with roll `α` (pins the disk's handedness against the camera's), and
-  a face-on disk shows no Doppler shift at any pointing;
+  including the disk: every hit in both CPU backends agrees (to 2e-3, one step of
+  drift) with the kinematic Doppler + gravitational factor built from the momentum
+  the integrator carried to the hit and the lab-frame normal, and shows Doppler shifts
+  of both signs against the gravitational value at its radius; reversing the normal
+  mirrors the image and flips the Doppler side; a disk at azimuth `α` seen unrolled
+  equals the disk at azimuth 0 seen with roll `α`, and differs from roll `−α` (pins
+  the disk's handedness against the camera's); a yawed and pitched camera sees a
+  face-on disk exactly as rays at the same angle from the hole sent by the unturned
+  pipeline; and the whole disk render at M = 2 reproduces M = 1 bit for bit. Renders
+  equal only to rounding tolerate a class flip on a boundary pixel, at most two;
 - `tests/cli.rs`: the binary's files, thread-count determinism, flag parity, argument
-  validation, the SIMD and exact backends writing byte-identical files, and (in a
-  `cuda-*` build) `auto` running on a machine without a device;
+  validation, the SIMD and exact backends writing byte-identical files, the disk
+  columns of `photon_data.csv` against the image and the scene (at M = 1 and M = 2),
+  and (in a `cuda-*` build) `auto` running on a machine without a device;
+- `tests/cuda_backend.rs` (a `cuda-*` build with a device; it reports a skip
+  otherwise): disk hits, crossing counts and `g` against the scalar integrator, hits
+  after the first 4096-step launch, and azimuths ignored without a disk band;
 - `tests/kernel_syntax.rs`: the CUDA kernel compiles as C++ against a shim and its
   typed parameter list matches the host launch.
 
-The CUDA kernel's disk detection is the same arithmetic as the CPU paths but has
-only been syntax-checked here (no device); a GPU run should agree with `--exact` to
-the few-ulp level described under *CUDA*, with status flips possible on pixels
-within rounding of `r_in`, `r_out` or the shadow edge.
+The CUDA kernel's disk detection is the same arithmetic as the CPU paths. On the
+development machine (no device) it has only been compiled as C++ and its host side
+type-checked; `tests/cuda_backend.rs` is the check to run on a GPU.

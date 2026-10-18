@@ -9,10 +9,11 @@
 //! observer's position vector `+x̂`: 0 is face-on, 90 edge-on, 180 face-on from the
 //! other side, which reverses the sense of rotation on the sky. The *azimuth* `a`
 //! turns `n` right-handedly about `+x̂`: `n = R_x(a) · (cos i, 0, sin i)`. At `a = 0`
-//! the normal lies in the x–z plane, so an inclined disk's near side is below the
-//! black hole in the image and its far side above. Both angles are measured against
-//! the observer's position, not the optical axis, so turning the camera does not move
-//! the disk.
+//! the normal lies in the x–z plane, so a disk inclined by less than 90° has its near
+//! side below the black hole in the image and its far side above; between 90° and
+//! 180° (the same plane as `(180° − i, a + 180°)`, turning the other way) the near side
+//! is above. Both angles are measured against the observer's position, not the
+//! optical axis, so turning the camera does not move the disk.
 //!
 //! The material orbits right-handedly about `n`: at `x` it moves along `n × x̂`. With
 //! `i = 90°, a = 0` (`n = +ẑ`) the material at `(0, −r, 0)`, on the observer's left,
@@ -45,10 +46,13 @@
 //! `r = 49/36 r_in`; the peak value is the user's `--disk-temperature`. Liouville's
 //! theorem (`I_ν/ν³` is invariant) makes the observed spectrum a blackbody at `g·T`:
 //! its bolometric intensity is `(gT)⁴` and its colour the chromaticity of a blackbody
-//! at `gT`; nothing is multiplied by `g⁴` on top of that. The pixel is that
-//! chromaticity scaled by the tone-mapped intensity `(gT/T_peak)⁴`. The temperature is
-//! a false-colour parameter: at realistic disk temperatures (10⁵–10⁷ K) every pixel
-//! would be white.
+//! at `gT`; nothing is multiplied by `g⁴` on top of that. The pixel's linear luminance
+//! is the tone-mapped intensity `1 − exp(−(gT/T_peak)⁴)` (0.63 at the peak
+//! temperature without Doppler shift, leaving headroom for the approaching side), so brightness rises
+//! monotonically with `g`, and its hue is the blackbody chromaticity at `gT`; a colour
+//! too saturated to show at that luminance is desaturated towards white at constant
+//! luminance ([`disk_rgb_linear`]). The temperature is a false-colour parameter: at
+//! realistic disk temperatures (10⁵–10⁷ K) every pixel would be white.
 
 use crate::coords::{dot, mat_vec, norm, normalize, rot_x, scale, Vec3};
 use crate::texture::Rgb;
@@ -244,10 +248,11 @@ pub fn blackbody_chromaticity(t: f64) -> [f64; 3] {
 }
 
 /// Maps a bolometric intensity relative to the disk's peak (`(gT/T_peak)⁴`, which
-/// exceeds 1 on the approaching side) to a display luminance in `[0, 1)`.
+/// exceeds 1 on the approaching side) to a display luminance in `[0, 1]` (1 only once
+/// the exponential underflows).
 #[inline]
 pub fn tonemap(relative_intensity: f64) -> f64 {
-    1.0 - (-2.0 * relative_intensity).exp()
+    1.0 - (-relative_intensity).exp()
 }
 
 /// Linear light in `[0, 1]` to an 8-bit sRGB value.
@@ -266,22 +271,49 @@ pub fn srgb_encode(v: f64) -> u8 {
     (s * 255.0).round() as u8
 }
 
-/// The pixel for a hit seen with redshift factor `g` on material at effective
-/// temperature `t_emit`, relative to the disk's peak temperature.
-pub fn disk_pixel(g: f64, t_emit: f64, t_peak: f64) -> Rgb {
+/// Rec. 709 / sRGB luminance weights of linear R, G, B (they sum to 1).
+pub const LUMINANCE_WEIGHTS: [f64; 3] = [0.2126, 0.7152, 0.0722];
+
+/// Linear luminance `Y` of a linear-sRGB colour.
+#[inline]
+pub fn luminance(c: [f64; 3]) -> f64 {
+    LUMINANCE_WEIGHTS[0] * c[0] + LUMINANCE_WEIGHTS[1] * c[1] + LUMINANCE_WEIGHTS[2] * c[2]
+}
+
+/// Linear-sRGB colour of a hit seen with redshift factor `g` on material at effective
+/// temperature `t_emit`: luminance exactly `tonemap((gT/T_peak)⁴)`, hue the blackbody
+/// chromaticity at `gT`. Where that hue cannot reach the luminance without a channel
+/// above 1, the colour is mixed with grey of the same luminance just enough to fit, so
+/// the luminance is kept and the hue desaturates towards white. Black when `gT` is not
+/// a number or below [`MIN_DRAWN_TEMPERATURE`].
+pub fn disk_rgb_linear(g: f64, t_emit: f64, t_peak: f64) -> [f64; 3] {
     let t_obs = g * t_emit;
     if t_obs.is_nan() || t_obs < MIN_DRAWN_TEMPERATURE {
-        return [0, 0, 0];
+        return [0.0, 0.0, 0.0];
     }
     let x = t_obs / t_peak;
     let x2 = x * x;
     let l = tonemap(x2 * x2);
     let c = blackbody_chromaticity(t_obs);
+    let k = l / luminance(c);
+    let rgb = [k * c[0], k * c[1], k * c[2]];
+    let m = rgb[0].max(rgb[1]).max(rgb[2]);
+    if m <= 1.0 {
+        return rgb;
+    }
+    // m > 1 ≥ l, so the mixing weight lies in [0, 1).
+    let s = (1.0 - l) / (m - l);
     [
-        srgb_encode(l * c[0]),
-        srgb_encode(l * c[1]),
-        srgb_encode(l * c[2]),
+        l + s * (rgb[0] - l),
+        l + s * (rgb[1] - l),
+        l + s * (rgb[2] - l),
     ]
+}
+
+/// The 8-bit pixel of [`disk_rgb_linear`].
+pub fn disk_pixel(g: f64, t_emit: f64, t_peak: f64) -> Rgb {
+    let c = disk_rgb_linear(g, t_emit, t_peak);
+    [srgb_encode(c[0]), srgb_encode(c[1]), srgb_encode(c[2])]
 }
 
 #[cfg(test)]
@@ -305,8 +337,8 @@ mod tests {
     fn kinematic_redshift(n: Vec3, x_hit: Vec3, k_hat: Vec3) -> f64 {
         let r = norm(x_hit);
         let f = 1.0 - 2.0 * M / r;
-        let omega = keplerian_omega(M, r);
-        let v = r * omega / f.sqrt();
+        // Circular-orbit speed measured by a static observer: v² = M/(r − 2M).
+        let v = (M / (r - 2.0 * M)).sqrt();
         let e_v = cross(n, normalize(x_hit));
         assert!(
             (norm(e_v) - 1.0).abs() < 1e-12,
@@ -319,8 +351,11 @@ mod tests {
     /// The One Thing First: on an oblique disk, the closed form that the renderer
     /// uses (conserved `p_t`, `p_φ`, the rotated normal's `n'_z`) equals the kinematic
     /// Doppler + gravitational factor computed from lab-frame geometry alone. This can
-    /// only pass if the spin sense, the inclination convention and the direction of
-    /// the frame rotation (`R_x(−β)`, not `R_x(+β)`) are all right together.
+    /// only pass if the spin sense, the sign of `b_z` and the direction of the frame
+    /// rotation (`R_x(−β)`, not `R_x(+β)`) are all right together. It holds for any
+    /// unit normal, so it does not pin how `n` follows from the inclination and
+    /// azimuth: `normal_from_angles_follows_the_documented_convention` and the
+    /// render-level tests in `tests/physics.rs` do.
     #[test]
     fn oblique_oracle_closed_form_equals_kinematic_redshift() {
         let n = Disk::normal_from_angles(55f64.to_radians(), 30f64.to_radians());
@@ -519,6 +554,25 @@ mod tests {
         }
         assert!(best <= 6000.0 + 1e-6 && best > 5999.9);
         assert!(d.temperature(20.0) < d.temperature(10.0));
+        // T⁴ follows the profile shape exactly (pins the quarter power, which the peak
+        // normalisation alone would not): T(12)⁴/T_peak⁴ = shape(12)/shape(49/6).
+        for r in [8.0, 12.0, 18.0] {
+            let ratio = (d.temperature(r) / 6000.0).powi(4);
+            let expect = temperature_shape(6.0, r) / temperature_shape(6.0, r_peak);
+            assert!(
+                (ratio - expect).abs() < 1e-12,
+                "r = {r}: {ratio} vs {expect}"
+            );
+        }
+        // One hand value: shape(12) = (1 − √½)/1728, shape(49/6) = (1 − 6/7)/(49/6)³.
+        let by_hand = ((1.0 - 0.5f64.sqrt()) / 1728.0 / ((1.0 / 7.0) / (49.0f64 / 6.0).powi(3)))
+            .powf(0.25)
+            * 6000.0;
+        assert!(
+            (d.temperature(12.0) - by_hand).abs() < 1e-9,
+            "{} vs {by_hand}",
+            d.temperature(12.0)
+        );
     }
 
     #[test]
@@ -545,23 +599,128 @@ mod tests {
 
     #[test]
     fn disk_pixel_brightens_with_g_and_is_black_when_cold() {
+        // Linear luminance is exactly the tone-mapped intensity, hence monotone in g,
+        // across the range a disk produces (the most blueshifted material must be the
+        // brightest, not just the bluest).
+        let mut last = -1.0;
+        let mut g = 0.3;
+        while g < 3.0 {
+            let c = disk_rgb_linear(g, 6000.0, 6000.0);
+            let x = g;
+            let expect = tonemap(x * x * x * x);
+            assert!(
+                (luminance(c) - expect).abs() < 1e-12,
+                "g = {g}: Y {} vs {expect}",
+                luminance(c)
+            );
+            assert!(c.iter().all(|v| (0.0..=1.0).contains(v)), "g = {g}: {c:?}");
+            // Strictly increasing until the tone curve reaches 1 to within rounding
+            // (gT ≳ 2.4 T_peak), never decreasing.
+            assert!(luminance(c) >= last, "g = {g}");
+            assert!(luminance(c) > last || last > 1.0 - 1e-12, "g = {g}");
+            last = luminance(c);
+            g += 0.01;
+        }
         let dim = disk_pixel(0.8, 6000.0, 6000.0);
         let unit = disk_pixel(1.0, 6000.0, 6000.0);
         let bright = disk_pixel(1.2, 6000.0, 6000.0);
-        let lum = |p: Rgb| p.iter().map(|&c| c as u32).sum::<u32>();
+        let hot = disk_pixel(1.5, 6000.0, 6000.0);
+        // Hotter is bluer: the blue-to-red ratio rises with g until the colour washes
+        // out to white at the brightest, most blueshifted spots.
+        let blue_red = |g: f64| {
+            let c = disk_rgb_linear(g, 6000.0, 6000.0);
+            c[2] / c[0]
+        };
         assert!(
-            lum(dim) < lum(unit) && lum(unit) < lum(bright),
+            blue_red(0.8) < blue_red(1.0) && blue_red(1.0) < blue_red(1.2),
             "{dim:?} {unit:?} {bright:?}"
         );
-        assert!(
-            bright[2] > unit[2],
-            "the approaching side is hotter, hence bluer"
-        );
+        assert!(hot.iter().all(|&v| v >= bright[1]), "{hot:?} {bright:?}");
+        // No extra g⁴: the pixel depends on g and T only through gT.
+        for g in [0.8, 1.2, 1.5] {
+            assert_eq!(
+                disk_pixel(g, 6000.0, 6000.0),
+                disk_pixel(1.0, g * 6000.0, 6000.0)
+            );
+        }
+        // Values pinned for the Python build to reproduce.
+        assert_eq!(dim, PINNED_PIXELS[0]);
+        assert_eq!(unit, PINNED_PIXELS[1]);
+        assert_eq!(bright, PINNED_PIXELS[2]);
+        assert_eq!(hot, PINNED_PIXELS[3]);
         assert_eq!(disk_pixel(1.0, 0.0, 6000.0), [0, 0, 0]);
         assert_eq!(disk_pixel(f64::NAN, 6000.0, 6000.0), [0, 0, 0]);
         assert_eq!(srgb_encode(0.0), 0);
         assert_eq!(srgb_encode(1.0), 255);
         assert_eq!(srgb_encode(f64::NAN), 0);
+    }
+
+    /// `disk_pixel(g, 6000, 6000)` for g = 0.8, 1.0, 1.2, 1.5; the Python build's tests
+    /// assert the same values.
+    const PINNED_PIXELS: [Rgb; 4] = [
+        [173, 154, 135],
+        [216, 206, 204],
+        [240, 239, 254],
+        [254, 254, 255],
+    ];
+
+    #[test]
+    fn srgb_encoding_rounds_half_away_from_zero() {
+        // 0.5/255/12.92 lies in the linear segment and encodes to exactly 0.5/255·255 =
+        // 0.5: f64::round gives 1 (Python's round() would give 0).
+        assert_eq!(srgb_encode(0.5 / 255.0 / 12.92), 1);
+        assert_eq!(srgb_encode(-1.0), 0);
+        assert_eq!(srgb_encode(2.0), 255);
+    }
+
+    #[test]
+    fn blackbody_chromaticity_matches_independent_values() {
+        // From the Planckian-locus fit evaluated by hand at one temperature per branch,
+        // then CIE xyY (Y = 1) → linear sRGB, normalised to the largest channel.
+        let by_hand = |x: f64, y: f64| {
+            let (cx, cz) = (x / y, (1.0 - x - y) / y);
+            let r = 3.2406 * cx - 1.5372 - 0.4986 * cz;
+            let g = -0.9689 * cx + 1.8758 + 0.0415 * cz;
+            let b = 0.0557 * cx - 0.2040 + 1.0570 * cz;
+            let m = r.max(g).max(b);
+            [(r / m).max(0.0), (g / m).max(0.0), (b / m).max(0.0)]
+        };
+        // 2000 K (both low branches), 3000 K (middle y branch), 6500 K (high branches).
+        let x2000 = -0.2661239e9 / 2000f64.powi(3) - 0.2343589e6 / 2000f64.powi(2)
+            + 0.8776956e3 / 2000.0
+            + 0.179910;
+        let y2000 = -1.1063814 * x2000.powi(3) - 1.34811020 * x2000.powi(2) + 2.18555832 * x2000
+            - 0.20219683;
+        let x3000 = -0.2661239e9 / 3000f64.powi(3) - 0.2343589e6 / 3000f64.powi(2)
+            + 0.8776956e3 / 3000.0
+            + 0.179910;
+        let y3000 = -0.9549476 * x3000.powi(3) - 1.37418593 * x3000.powi(2) + 2.09137015 * x3000
+            - 0.16748867;
+        let x6500 = -3.0258469e9 / 6500f64.powi(3)
+            + 2.1070379e6 / 6500f64.powi(2)
+            + 0.2226347e3 / 6500.0
+            + 0.240390;
+        let y6500 = 3.0817580 * x6500.powi(3) - 5.87338670 * x6500.powi(2) + 3.75112997 * x6500
+            - 0.37001483;
+        // The fit puts 6500 K close to the D65 white point (0.3127, 0.3290).
+        assert!(
+            (x6500 - 0.3135).abs() < 2e-3 && (y6500 - 0.3237).abs() < 6e-3,
+            "{x6500} {y6500}"
+        );
+        for (t, x, y) in [
+            (2000.0, x2000, y2000),
+            (3000.0, x3000, y3000),
+            (6500.0, x6500, y6500),
+        ] {
+            let got = blackbody_chromaticity(t);
+            let expect = by_hand(x, y);
+            for k in 0..3 {
+                assert!(
+                    (got[k] - expect[k]).abs() < 1e-9,
+                    "{t} K channel {k}: {got:?} vs {expect:?}"
+                );
+            }
+        }
     }
 
     #[test]

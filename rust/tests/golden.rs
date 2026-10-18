@@ -561,8 +561,8 @@ fn disk_scene_matches_python() {
         sc.disk_inclination_deg.to_radians(),
         sc.disk_azimuth_deg.to_radians(),
     );
-    for k in 0..3 {
-        assert!((normal[k] - sc.disk_normal[k]).abs() < 1e-15, "disk normal");
+    for (a, b) in normal.iter().zip(&sc.disk_normal) {
+        assert!((a - b).abs() < 1e-15, "disk normal");
     }
     let disk = Disk::new(
         normal,

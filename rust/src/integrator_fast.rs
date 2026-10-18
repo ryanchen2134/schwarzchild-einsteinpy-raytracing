@@ -400,6 +400,7 @@ mod tests {
     use crate::disk::Disk;
     use crate::initial_conditions::initial_conditions;
     use crate::integrator::DiskBand;
+    use std::f64::consts::PI;
 
     fn pipeline_rays(size: usize, mass: f64) -> Vec<Ray> {
         let cam = Camera::new([30.0 * mass, 0.0, 0.0], 80f64.to_radians(), size, size).unwrap();
@@ -526,9 +527,13 @@ mod tests {
             .iter()
             .filter(|r| r.exit != ExitReason::Disk && r.plane_crossings > 0)
             .count();
+        let multi = exact
+            .iter()
+            .filter(|r| r.exit == ExitReason::Disk && r.plane_crossings >= 2)
+            .count();
         assert!(
-            hits > 20 && passed > 0,
-            "{hits} hits, {passed} rays crossed outside the band"
+            hits > 20 && passed > 0 && multi > 0,
+            "{hits} hits, {passed} rays crossed outside the band, {multi} hits after an out-of-band crossing"
         );
         // Mixed lanes: some rays detect, some do not; the detector must not leak across lanes.
         let mut mixed = rays.clone();
@@ -549,26 +554,73 @@ mod tests {
 
     #[test]
     fn disk_hits_rescale_with_mass() {
-        let disk = Disk::new(
-            Disk::normal_from_angles(55f64.to_radians(), 30f64.to_radians()),
-            15.0,
-            50.0,
-            6000.0,
-            2.5,
-            75.0,
-        )
-        .unwrap();
-        let s = IntegratorSettings::new(20_000, 0.025, 0.01, 77.5, 5.0).with_disk(DiskBand {
-            r_in: 15.0,
-            r_out: 50.0,
+        // M = 2 scales every length by a power of two, so the M = 2 run must reproduce
+        // the M = 1 run bit for bit with lengths doubled, in both CPU paths.
+        let normal = Disk::normal_from_angles(55f64.to_radians(), 30f64.to_radians());
+        let disk1 = Disk::new(normal, 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap();
+        let disk2 = Disk::new(normal, 12.0, 40.0, 6000.0, 2.0, 60.0).unwrap();
+        let s1 = settings().with_disk(DiskBand {
+            r_in: 6.0,
+            r_out: 20.0,
         });
-        let rays = disk_rays(7, 2.5, &disk);
-        let exact = integrate_all(&rays, 5.0, &s);
-        let fast = integrate_batch_fast(&rays, 5.0, &s, || {});
-        assert_same(&fast, &exact);
-        assert!(exact.iter().any(|r| r.exit == ExitReason::Disk));
-        for r in exact.iter().filter_map(|r| r.disk_hit) {
-            assert!(r.r >= 15.0 && r.r <= 50.0);
+        let s2 = IntegratorSettings::new(20_000, 0.02, 0.01, 62.0, 4.0).with_disk(DiskBand {
+            r_in: 12.0,
+            r_out: 40.0,
+        });
+        let rays1 = disk_rays(9, 1.0, &disk1);
+        let rays2 = disk_rays(9, 2.0, &disk2);
+        let exact1 = integrate_all(&rays1, 2.0, &s1);
+        let exact2 = integrate_all(&rays2, 4.0, &s2);
+        let fast2 = integrate_batch_fast(&rays2, 4.0, &s2, || {});
+        assert_same(&fast2, &exact2);
+        let mut hits = 0;
+        for (a, b) in exact1.iter().zip(&exact2) {
+            assert_eq!(a.exit, b.exit);
+            assert_eq!(a.n_steps, b.n_steps);
+            assert_eq!(a.plane_crossings, b.plane_crossings);
+            assert_eq!((2.0 * a.q[1]).to_bits(), b.q[1].to_bits());
+            match (a.disk_hit, b.disk_hit) {
+                (Some(h1), Some(h2)) => {
+                    assert_eq!((2.0 * h1.r).to_bits(), h2.r.to_bits());
+                    assert_eq!(h1.phi.to_bits(), h2.phi.to_bits());
+                    hits += 1;
+                }
+                (None, None) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(hits > 15, "{hits}");
+    }
+
+    #[test]
+    fn a_disk_hit_on_the_last_permitted_step_matches_the_scalar_integrator() {
+        // The aimed ray of the scalar test, in a group whose other lanes finish earlier.
+        let aimed = initial_conditions([30.0, 0.0, 0.0], [24.0, 2.0, 0.0], 1.0);
+        let mut rays = vec![Ray::with_disk(aimed.q0, aimed.p0, PI / 2.0)];
+        for y in [0.0, 0.3, 0.6] {
+            let init = initial_conditions([30.0, 0.0, 0.0], [24.0, y, 0.0], 1.0);
+            rays.push(Ray::with_disk(init.q0, init.p0, PI / 2.0));
+        }
+        let band = DiskBand {
+            r_in: 6.0,
+            r_out: 20.0,
+        };
+        let full = integrate_ray(&rays[0], 2.0, &settings().with_disk(band));
+        assert_eq!(full.exit, ExitReason::Disk);
+        for steps in [full.n_steps, full.n_steps - 1] {
+            let s = IntegratorSettings {
+                steps,
+                ..settings().with_disk(band)
+            };
+            let exact = integrate_all(&rays, 2.0, &s);
+            let fast = integrate_batch_fast(&rays, 2.0, &s, || {});
+            assert_same(&fast, &exact);
+            let expect = if steps == full.n_steps {
+                ExitReason::Disk
+            } else {
+                ExitReason::StepLimit
+            };
+            assert_eq!(exact[0].exit, expect, "steps = {steps}");
         }
     }
 

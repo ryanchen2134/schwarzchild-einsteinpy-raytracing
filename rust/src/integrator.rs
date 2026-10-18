@@ -30,9 +30,12 @@
 //! never reduced modulo `2π` inside the integrator, so the floor is monotone along
 //! the ray. The crossing radius is interpolated linearly in `φ` between the two
 //! states. Crossings are only looked for from the second step on: every ray starts
-//! at the observer, which sits on the crossing line of an edge-on disk, and a
-//! crossing within one step of the start would lie outside the disk anyway
-//! (`r_out < r_obs` is enforced). Each step's crossing check runs before the next
+//! at the observer, which sits on the crossing line of an edge-on disk, where
+//! rounding could register a crossing at `r_obs`. A null ray moves at most
+//! `|dr/dλ| ≤ p_t < 1` per unit affine parameter, so a crossing during the first
+//! step lies within `δ` of `r_obs`; it is neither counted nor able to hit the disk as
+//! long as `r_out < r_obs − δ`, which the renderer and the CLI enforce
+//! ([`crate::render::render_curved`]). Each step's crossing check runs before the next
 //! step's capture/escape check, so a crossing on a ray's last step is not lost. A
 //! crossing inside `[r_in, r_out]` ends the ray with [`ExitReason::Disk`]; every
 //! crossing is counted. The arithmetic is written out so that the SIMD and CUDA
@@ -589,8 +592,10 @@ pub fn integrate_trajectory_bounded(
     }
     // A boundary crossed on the last permitted step is detected after the loop, and a
     // disk hit ends the loop after the step; the exit state is still recorded.
+    // Compare bit patterns: a diverged NaN state already recorded is not recorded again.
     let last = run.q_out();
-    if exit != ExitReason::StepLimit && traj.last() != Some(&last) {
+    let same = |q: &[f64; 4]| q.map(f64::to_bits) == last.map(f64::to_bits);
+    if exit != ExitReason::StepLimit && !traj.last().is_some_and(same) {
         traj.push(last);
     }
     (traj, run.finish(exit))
@@ -745,10 +750,62 @@ mod tests {
         assert_eq!(res2.q[3], res1.q[3]);
     }
 
-    /// A straight line in a flat plane, fed to the detector step by step: the hit
-    /// radius converges to the exact line–line intersection as the square of the step.
+    /// The linear-interpolation error of the hit radius is `C h² f (1 − f)` for a
+    /// crossing at fraction `f` of the step, so the step is placed to put the crossing
+    /// at the same fraction for every `h`; then halving `h` must divide the error by 4.
+    /// Taking `r_prev` instead (a first-order rule) divides it by 2, which the test
+    /// checks it can tell apart.
     #[test]
-    fn crossing_detector_on_a_straight_line_converges_as_the_step_squared() {
+    fn crossing_detector_converges_as_the_step_squared_at_a_fixed_fraction() {
+        let x0 = [30.0f64, -4.0];
+        let d = [-0.96f64, 0.28];
+        let phi_d = 2.0f64;
+        let det = CrossingDetector {
+            phi_d,
+            r_in: 0.0,
+            r_out: 1e9,
+        };
+        let (sd, cd) = phi_d.sin_cos();
+        let lambda_c = -(x0[0] * sd - x0[1] * cd) / (d[0] * sd - d[1] * cd);
+        let at = |l: f64| {
+            let (x, y) = (x0[0] + l * d[0], x0[1] + l * d[1]);
+            (x.hypot(y), y.atan2(x))
+        };
+        let exact_r = at(lambda_c).0;
+        for f in [0.25, 0.5, 0.8] {
+            let errors = |h: f64| {
+                let (r0, p0) = at(lambda_c - f * h);
+                let (r1, p1) = at(lambda_c + (1.0 - f) * h);
+                let c = det
+                    .check(r0, p0, r1, p1)
+                    .expect("the step straddles the crossing");
+                ((c.r - exact_r).abs(), (r0 - exact_r).abs())
+            };
+            let (e1, z1) = errors(0.4);
+            let (e2, z2) = errors(0.2);
+            let (e3, z3) = errors(0.1);
+            for (a, b) in [(e1, e2), (e2, e3)] {
+                assert!(
+                    (3.6..4.4).contains(&(a / b)),
+                    "f = {f}: ratio {} ({e1} {e2} {e3})",
+                    a / b
+                );
+            }
+            for (a, b) in [(z1, z2), (z2, z3)] {
+                assert!(
+                    (1.8..2.2).contains(&(a / b)),
+                    "first-order reference: {}",
+                    a / b
+                );
+            }
+        }
+    }
+
+    /// A straight line in a flat plane, fed to the detector step by step from a fixed
+    /// start: one crossing, at the exact line–line intersection to within the
+    /// interpolation error.
+    #[test]
+    fn crossing_detector_on_a_straight_line_finds_one_crossing() {
         // Line x(λ) = x0 + λ d in the plane, crossing line at azimuth phi_d.
         let x0 = [30.0f64, -4.0];
         let d = [-0.96f64, 0.28];
@@ -801,16 +858,51 @@ mod tests {
             (1, 1, 1),
             "a straight line crosses a line through the origin once"
         );
-        let (e1, e2, e3) = (
-            (r1 - exact_r).abs(),
-            (r2 - exact_r).abs(),
-            (r3 - exact_r).abs(),
+        for r in [r1, r2, r3] {
+            assert!((r - exact_r).abs() < 2e-3, "{r} vs {exact_r}");
+        }
+    }
+
+    /// Both crossing directions on a spiral `r = 9 + 0.1 φ`: forward (d = +1, the
+    /// boundary is `k`) and backward (d = −1, the boundary is `k_prev`) find the same
+    /// azimuths, and the interpolated radius sits on the spiral.
+    #[test]
+    fn crossings_on_a_spiral_agree_in_both_directions() {
+        let det = CrossingDetector {
+            phi_d: 0.7,
+            r_in: 0.0,
+            r_out: 100.0,
+        };
+        let spiral = |phi: f64| 9.0 + 0.1 * phi;
+        let sweep = |forward: bool| {
+            let mut out = Vec::new();
+            let (start, step) = if forward {
+                (0.0, 0.013)
+            } else {
+                (4.0 * PI, -0.013)
+            };
+            let mut prev = start;
+            for k in 1..1000 {
+                let phi = start + k as f64 * step;
+                if let Some(c) = det.check(spiral(prev), prev, spiral(phi), phi) {
+                    assert!((c.r - spiral(c.phi)).abs() < 1e-12, "{c:?}");
+                    out.push(c.phi);
+                }
+                prev = phi;
+            }
+            out
+        };
+        let fwd = sweep(true);
+        let mut back = sweep(false);
+        back.reverse();
+        assert_eq!(fwd.len(), 4);
+        assert_eq!(
+            fwd, back,
+            "the same boundaries, k on the way up and k_prev on the way down"
         );
-        assert!(e3 < 1e-3 && e2 > e3 && e1 > e2, "{e1} {e2} {e3}");
-        assert!(
-            (e1 / e2) > 3.0 && (e2 / e3) > 3.0,
-            "second order: {e1} {e2} {e3}"
-        );
+        for (k, phi) in fwd.iter().enumerate() {
+            assert!((phi - (0.7 + k as f64 * PI)).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -940,6 +1032,24 @@ mod tests {
             assert_eq!(res.exit, ExitReason::Escaped, "{pix:?}");
             assert_eq!(res.plane_crossings, 0, "{pix:?}");
         }
+        // The case the first-step rule exists for: a crossing line a hair ahead of the
+        // observer, crossed during the very first step at r ≈ r_obs.
+        let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 6.0, 0.0], 1.0);
+        let ray = Ray::with_disk(init.q0, init.p0, 1e-12);
+        let (traj, _) = integrate_trajectory(&ray, 2.0, &s);
+        let det = CrossingDetector {
+            phi_d: 1e-12,
+            r_in: 6.0,
+            r_out: 29.5,
+        };
+        let first = det.check(traj[0][1], traj[0][3], traj[1][1], traj[1][3]);
+        assert!(
+            first.is_some_and(|c| c.r > 29.9),
+            "the first step does cross: {first:?}"
+        );
+        let res = integrate_ray(&ray, 2.0, &s);
+        assert_eq!(res.exit, ExitReason::Escaped);
+        assert_eq!(res.plane_crossings, 0, "but the first step is not checked");
     }
 
     #[test]
@@ -969,6 +1079,38 @@ mod tests {
         assert_eq!(r3.exit, ExitReason::Disk);
         assert_eq!(btraj.last().unwrap(), &full.q);
         assert!(btraj.len() <= 81);
+    }
+
+    /// A near-critical ray loops the hole: it crosses the plane of a face-on disk
+    /// several times inside `r_in` (counted, not stopping) before one crossing lands
+    /// in the band or the ray leaves.
+    #[test]
+    fn a_looping_ray_counts_every_crossing() {
+        let alpha = 1.002 * crate::schwarzschild::BlackHole::new(1.0).capture_angle(30.0);
+        let (p_r, p_th, p_ph) = crate::initial_conditions::equatorial_momentum(alpha, 30.0, 1.0);
+        let p_t =
+            crate::initial_conditions::null_p_t(1.0 - 2.0 / 30.0, 30.0, PI / 2.0, p_r, p_th, p_ph);
+        let s = IntegratorSettings::new(200_000, 0.01, 0.01, 31.0, 2.0).with_disk(DiskBand {
+            r_in: 6.0,
+            r_out: 20.0,
+        });
+        let ray = Ray::with_disk([0.0, 30.0, PI / 2.0, 0.0], [p_t, p_r, p_th, p_ph], PI / 2.0);
+        let res = integrate_ray(&ray, 2.0, &s);
+        let (traj, _) = integrate_trajectory(&ray, 2.0, &s);
+        // Count by hand along the recorded states: every boundary of floor((φ−π/2)/π).
+        let boundaries = traj
+            .windows(2)
+            .skip(1)
+            .filter(|w| ((w[1][3] - PI / 2.0) / PI).floor() != ((w[0][3] - PI / 2.0) / PI).floor())
+            .count();
+        assert!(res.plane_crossings >= 2, "{res:?}");
+        assert_eq!(res.plane_crossings as usize, boundaries, "{res:?}");
+        assert_eq!(res.exit, ExitReason::Disk, "{res:?}");
+        let hit = res.disk_hit.unwrap();
+        assert!(
+            (hit.phi - (PI / 2.0 + (res.plane_crossings - 1) as f64 * PI)).abs() < 1e-9,
+            "the hit is the last counted boundary: {hit:?}"
+        );
     }
 
     #[test]
