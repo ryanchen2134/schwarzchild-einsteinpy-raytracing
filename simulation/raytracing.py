@@ -10,6 +10,8 @@ from PIL import Image
 import pandas as pd
 from simulation.utils import get_initial_conditions
 from simulation.utils import spherical_to_cartesian_fast, cartesian_to_spherical_fast
+from simulation.utils import camera_basis, pixel_positions as camera_pixel_positions
+from simulation.disk import disk_pixel, hit_position_lab, redshift
 
 
 def run_manual_simulation(
@@ -19,7 +21,9 @@ def run_manual_simulation(
     boundary_radius=None,
     patch_center_theta=np.pi/2, patch_center_phi=np.pi, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
     flip_theta=False, flip_phi=False,
-    n_samples=0
+    n_samples=0,
+    yaw=0.0, pitch=0.0, roll=0.0,
+    disk=None
 ):
     """
     Run manual ray tracing simulation with tqdm progress bar.
@@ -27,6 +31,13 @@ def run_manual_simulation(
     Returns the final image as a numpy array.
     Only maps the background image if the boundary hit is within the specified patch (center, size, flip options).
     If return_sampled_trajectories is True, also returns a list of sampled photon trajectories (in Cartesian coordinates).
+
+    yaw, pitch, roll (radians) turn the camera (simulation.utils.camera_basis); the
+    observer stays on the +x axis. `disk` is an optional simulation.disk.Disk: rays
+    that cross its plane inside [r_in, r_out] end there (collision 'disk') and are
+    coloured from their redshift and the local temperature; the photon table gains
+    the columns disk_r, disk_phi, disk_x, disk_y, disk_z, disk_g, disk_temp and
+    plane_crossings.
     """
     logging.info("Starting manual ray tracing simulation...")
     h, w = observer.image_size
@@ -46,45 +57,14 @@ def run_manual_simulation(
             j = random.randint(0, w-1)
             sampled_indices.add((i, j))
 
-    # Image plane geometry (robust pinhole camera model)
-    
-    # get position of observer and black hole
+    # Image plane geometry (pinhole camera, simulation.utils): the observer on +x looks
+    # along -x with right = +y, up = +z, turned by yaw, pitch, roll. Row i = 0 is the
+    # bottom row of the image.
     obs_pos = np.array(observer.position)
-    # bh_pos = np.array(bh.position) if hasattr(bh, 'position') else np.zeros(3)
-    # bh_pos = np.array([0, 0, 0])
-    
-    #define the optical axis (should be in the (negative) x direction)
-    # optical_axis = (bh_pos - obs_pos)
-    # optical_axis = optical_axis / np.linalg.norm(optical_axis)
-    optical_axis = np.array([-1, 0, 0])
-    #define the up vector (related to the pixels of the image plane) (should be in the z direction)
-    # up_guess = np.array([0, 0, 1]) # is always true since the observer is always looking at the black hole
-    # if np.allclose(np.cross(optical_axis, up_guess), 0):  #instead, check if norm of cross is close to 0
-    # if np.linalg.norm(np.cross(optical_axis, up_guess)) < 1e-4:
-    #     up_guess = np.array([0, 1, 0])
-    # right = np.cross(up_guess, optical_axis)
-    
-    # right = right / np.linalg.norm(right)
-    right = np.array([0, 1, 0])
-    # up_vec = np.cross(optical_axis, right)
-    # up_vec = up_vec / np.linalg.norm(up_vec)
-    up_vec = np.array([0, 0, 1])
-    
+    optical_axis, right, up_vec = camera_basis(yaw, pitch, roll)
     fov = observer.fov
     h, w = observer.image_size
-    
-    plane_dist = 0.2 * np.linalg.norm(obs_pos)
-    plane_center = obs_pos + optical_axis * plane_dist
-    
-    plane_width = 2 * plane_dist * np.tan(fov/2)
-    plane_height = plane_width * (h/w)
-    pixel_positions = np.zeros((h, w, 3))
-    for i in range(h):
-        for j in range(w):
-            u = (j + 0.5) / w - 0.5 # first term is a normalized quantity, second term (-0.5) moves to the left/top
-            v = (i + 0.5) / h - 0.5
-            pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
-            pixel_positions[i, j] = pixel_pos
+    pixel_positions = camera_pixel_positions(obs_pos, fov, h, w, optical_axis, right, up_vec)
 
     # if boundary_radius is None:
     #     boundary_radius = 10 * bh.rs
@@ -106,6 +86,10 @@ def run_manual_simulation(
         h_phis = np.zeros((h*w, ), dtype=np.float64)
         # rotaton about the optical axis
         betas = np.zeros((h*w, ), dtype=np.float64)
+        # the disk in each ray's rotated frame: crossing-line azimuth (NaN: no
+        # detection) and the normal's component along the ray's angular momentum
+        disk_phis = np.full((h*w, ), np.nan, dtype=np.float64)
+        disk_nzs = np.zeros((h*w, ), dtype=np.float64)
         #
         for idx, (i, j) in tqdm(list(enumerate([(i, j) for i in range(h) for j in range(w)])), desc="Calculating Trajectories", unit="ray"):
             q0, p0, alpha0, h_r, h_theta, h_phi, beta = get_initial_conditions(obs_pos, pixel_positions[i, j], mass_bh=bh.mass)
@@ -116,10 +100,16 @@ def run_manual_simulation(
             h_thetas[idx] = h_theta
             h_phis[idx] = h_phi
             betas[idx] = beta
+            if disk is not None:
+                disk_phis[idx], disk_nzs[idx] = disk.ray_frame(beta)
 
+        if disk is not None:
+            disk_kwargs = dict(disk_phi=disk_phis, disk_r_in=disk.r_in, disk_r_out=disk.r_out)
+        else:
+            disk_kwargs = {}
         cuda_integrator = CUDASchwarzschildIntegrator(steps=steps, delta=delta, mass=bh.mass, omega=omega, r_max=boundary_radius)
         print("Beginning integration (CUDA)...")
-        out_qs, _ = cuda_integrator.integrate_batch(q0s, p0s)
+        out_qs, exit_status, disk_hits, plane_crossings = cuda_integrator.integrate_batch(q0s, p0s, **disk_kwargs)
         print("Integration complete (CUDA)")
 
             # ── parameters ────────────────────────────────────────────────────────
@@ -132,9 +122,12 @@ def run_manual_simulation(
         sample_flat_idx = np.array([i*w + j for (i, j) in sampled_indices], dtype=np.int64)
         q0s_samples = q0s[sample_flat_idx]
         p0s_samples = p0s[sample_flat_idx]
+        sample_disk_kwargs = dict(disk_kwargs)
+        if disk is not None:
+            sample_disk_kwargs['disk_phi'] = disk_phis[sample_flat_idx]
 
         print("Beginning integration of samples (CUDA)...")
-        traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples)
+        traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples, **sample_disk_kwargs)
         print("Integration of samples complete (CUDA)")
 
         # ── down-sample along the integration axis ────────────────────────
@@ -150,7 +143,7 @@ def run_manual_simulation(
             traj_cart = []
             for step in keep_idx:
                 t, r, th, ph = traj_out[sample_idx, step]
-                _, x, y, z = spherical_to_cartesian_fast(_, r, th, ph)
+                _, x, y, z = spherical_to_cartesian_fast(0, r, th, ph)
                 #rotate back by beta
                 cos, sin = np.cos(betas[sample_flat_idx[sample_idx]]), np.sin(betas[sample_flat_idx[sample_idx]]) #this is the rotation about the optical axis
                 R_x = np.array([[1, 0, 0],
@@ -210,7 +203,25 @@ def run_manual_simulation(
         # Rays beyond this radius left the domain by a wide margin; in units of M like
         # the rest of the pipeline (100 at M = 1, so the default run is unchanged).
         numerical_error_radius = 100.0 * bh.mass
-        if not np.isfinite(r_bh) or r_bh <= 0.0:
+        # Disk columns: NaN unless the ray ended on the disk.
+        disk_r = disk_phi = disk_x = disk_y = disk_z = disk_g = disk_temp = float('nan')
+        if exit_status[idx] == 4 and disk is not None:
+            # The ray crossed the disk plane inside [r_in, r_out]: shade it from the
+            # redshift of the conserved initial momenta (simulation.disk) and the
+            # local effective temperature. A hit the physics rules out (1 - Omega b_z
+            # <= 0) is reported as a numerical error.
+            disk_r = disk_hits[idx, 0].item()
+            disk_phi = disk_hits[idx, 1].item()
+            disk_x, disk_y, disk_z = hit_position_lab(disk_r, disk_phi, betas[idx].item())
+            disk_g = redshift(bh.mass, disk_r, p0s[idx, 0].item(), p0s[idx, 3].item(), disk_nzs[idx].item(), r_obs)
+            disk_temp = disk.temperature(disk_r)
+            if np.isfinite(disk_g) and disk_g > 0.0:
+                value = disk_pixel(disk_g, disk_temp, disk.peak_temperature)
+                collision = 'disk'
+            else:
+                value = (255, 0, 0)
+                collision = 'numerical error'
+        elif not np.isfinite(r_bh) or r_bh <= 0.0:
             value = (255, 0, 0)
             collision = 'numerical error'
         elif r_bh <= bh.rs*1.2:
@@ -283,7 +294,11 @@ def run_manual_simulation(
                             'collision': collision, 
                             'h_r': h_rs[idx].item(), 'h_theta': h_thetas[idx].item(), 'h_phi': h_phis[idx].item(),
                             'p0_t': p0s[idx, 0].item(), 'p0_r': p0s[idx, 1].item(), 'p0_th': p0s[idx, 2].item(), 'p0_ph': p0s[idx, 3].item(),
-                            'alpha0': alpha0s[idx].item(), 'analytic_capture': analytic_capture})
+                            'alpha0': alpha0s[idx].item(), 'analytic_capture': analytic_capture,
+                            'disk_r': disk_r, 'disk_phi': disk_phi,
+                            'disk_x': disk_x, 'disk_y': disk_y, 'disk_z': disk_z,
+                            'disk_g': disk_g, 'disk_temp': disk_temp,
+                            'plane_crossings': int(plane_crossings[idx])})
         
     plt.imsave('images/manual_output.png', img)
     logging.info("Saved manual_output.png")
@@ -310,7 +325,9 @@ def run_manual_simulation(
         n_captured = sum(1 for row in photon_rows if row['collision'] == 'bh')
         n_escaped = sum(1 for row in photon_rows if row['collision'] == ('escape_no_patch'))
         n_bg = sum(1 for row in photon_rows if row['collision'] == 'escape_bg')
-        print(f"Summary: {n_captured} rays captured by BH, {n_escaped} rays escaped, {n_bg} rays hit the background image.")
+        n_disk = sum(1 for row in photon_rows if row['collision'] == 'disk')
+        print(f"Summary: {n_captured} rays captured by BH, {n_escaped} rays escaped, {n_bg} rays hit the background image, {n_disk} rays hit the disk.")
+        print(f"  Hit disk: {n_disk}")
     else:
         print("Summary counts not available (CPU fallback mode).")
     if n_samples > 0:

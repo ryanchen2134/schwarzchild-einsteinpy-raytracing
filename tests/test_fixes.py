@@ -86,11 +86,11 @@ def test_integrator_is_scale_free_in_the_mass():
     alpha = 0.2
     q1, p1 = _ray(alpha, 1.0)
     unit = CUDASchwarzschildIntegrator(steps=3000, delta=0.01, mass=1.0, omega=0.01, r_max=31.0)
-    out1, _ = unit.integrate_batch(q1, p1)
+    out1, *_ = unit.integrate_batch(q1, p1)
     # M = 2: lengths double (exact in binary), so the run must be bit-identical.
     q2, p2 = _ray(alpha, 2.0)
     two = CUDASchwarzschildIntegrator(steps=3000, delta=0.02, mass=2.0, omega=0.01, r_max=62.0)
-    out2, _ = two.integrate_batch(q2, p2)
+    out2, *_ = two.integrate_batch(q2, p2)
     assert out2[0, 0] == 2.0 * out1[0, 0]
     assert out2[0, 1] == 2.0 * out1[0, 1]
     assert out2[0, 2] == out1[0, 2]
@@ -98,7 +98,7 @@ def test_integrator_is_scale_free_in_the_mass():
     # M = 2.5 is not a power of two: equal to rounding.
     q3, p3 = _ray(alpha, 2.5)
     big = CUDASchwarzschildIntegrator(steps=3000, delta=0.025, mass=2.5, omega=0.01, r_max=77.5)
-    out3, _ = big.integrate_batch(q3, p3)
+    out3, *_ = big.integrate_batch(q3, p3)
     assert out3[0, 1] / 2.5 == pytest.approx(out1[0, 1], abs=1e-9)
     assert out3[0, 3] == pytest.approx(out1[0, 3], abs=1e-9)
     # The trajectory kernel is rescaled the same way.
@@ -119,8 +119,8 @@ def test_escape_radius_is_scaled_with_the_mass():
     q2, p2 = _ray(2.9, 2.0)
     unit = CUDASchwarzschildIntegrator(steps=400, delta=0.01, mass=1.0, omega=0.01, r_max=31.0)
     two = CUDASchwarzschildIntegrator(steps=400, delta=0.02, mass=2.0, omega=0.01, r_max=62.0)
-    out1, _ = unit.integrate_batch(q1, p1)
-    out2, _ = two.integrate_batch(q2, p2)
+    out1, *_ = unit.integrate_batch(q1, p1)
+    out2, *_ = two.integrate_batch(q2, p2)
     assert 31.0 <= out1[0, 1] < 31.0 + 2 * 0.01, "the cutoff fired within one step of r_max"
     assert out2[0, 1] == 2.0 * out1[0, 1]
 
@@ -132,7 +132,7 @@ def test_unit_mass_run_is_unchanged_by_the_rescaling():
 
     q, p = _ray(0.2, 1.0)
     integ = CUDASchwarzschildIntegrator(steps=2000, delta=0.01, mass=1.0, omega=0.01, r_max=31.0)
-    out, _ = integ.integrate_batch(q, p)
+    out, *_ = integ.integrate_batch(q, p)
     direct = np.zeros((1, 4))
     fantasy_integrate_batch_ord2[1, 32](q, p, 2000, 0.01, 2.0, 31.0, 0.01, direct)
     assert np.array_equal(out, direct)

@@ -599,10 +599,162 @@ def fantasy_integrate_batch_ord2_full(q0s, p0s, steps, delta, rs, r_max, omega, 
             break
         _fantasy_step_ord2(q1, p1, q2, p2, delta, rs, omega)
 
+# ------------------------- Kernels with disk-crossing detection ----------------
+# The same FANTASY loop with the accretion-disk plane test of the Rust build
+# (integrator.rs, "Disk crossings"; fantasy.cu is the direct template). A ray whose
+# disk_phi is finite is checked after every step from the second step on for a change
+# of exactly one in floor((phi - disk_phi)/pi); the crossing radius is interpolated
+# linearly in phi, counted, and ends the ray when it lies in [disk_r_in, disk_r_out].
+# phi is never reduced modulo 2*pi, so the floor is monotone along the ray. Each
+# step's crossing check runs before the next step's capture/escape check, so a
+# crossing on a ray's last step is not lost. With every disk_phi NaN the loop is the
+# one of fantasy_integrate_batch_ord2 and the results are bit-identical.
+#
+# Exit status codes (out_status): 0 step budget exhausted inside the domain,
+# 1 captured (r <= 1.1 rs), 2 escaped (r >= r_max), 4 hit the accretion disk.
+# (3, "diverged", is reserved for parity with the Rust build; these kernels keep the
+# old kernels' exit test, which does not detect a non-finite state.)
+
+_PI = 3.141592653589793  # the same double as math.pi
+
+
+@cuda.jit
+def fantasy_integrate_batch_ord2_disk(q0s, p0s, steps, delta, rs, r_max, omega,
+                                      disk_phi, disk_r_in, disk_r_out,
+                                      out_qs, out_status, out_hit, out_crossings):
+    """fantasy_integrate_batch_ord2 plus disk-crossing detection.
+
+    * disk_phi      : (N,) crossing-line azimuth per ray, NaN for no detection
+    * disk_r_in/out : radial band of the disk (same units as the radii)
+    * out_status    : (N,) int32 exit status (see above)
+    * out_hit       : (N,2) float64, (r_hit, phi_c) written when the status is 4
+    * out_crossings : (N,) int32, every crossing of the plane, the hit included
+    """
+    i = cuda.grid(1)
+    n = q0s.shape[0]
+    if i >= n:
+        return
+    q1 = cuda.local.array(4, dtype=float64)
+    p1 = cuda.local.array(4, dtype=float64)
+    q2 = cuda.local.array(4, dtype=float64)
+    p2 = cuda.local.array(4, dtype=float64)
+    for a in range(4):
+        q1[a] = q0s[i, a]
+        p1[a] = p0s[i, a]
+        q2[a] = q0s[i, a]
+        p2[a] = p0s[i, a]
+    phi_d = disk_phi[i]
+    detect = math.isfinite(phi_d)
+    n_cross = 0
+    st = 0
+    for step in range(steps):
+        # early exit if outside domain (checked before the step, as the old kernel does)
+        if q1[1] <= 1.1 * rs:
+            st = 1
+            break
+        if q1[1] >= r_max:
+            st = 2
+            break
+        r_prev = q1[1]
+        ph_prev = q1[3]
+        _fantasy_step_ord2(q1, p1, q2, p2, delta, rs, omega)
+        # step counts the steps before this one: check from the second step on.
+        if detect and step >= 1:
+            a_prev = (ph_prev - phi_d) / _PI
+            a_now = (q1[3] - phi_d) / _PI
+            if math.isfinite(a_prev) and math.isfinite(a_now):
+                k_prev = math.floor(a_prev)
+                k = math.floor(a_now)
+                d = k - k_prev
+                if d == 1 or d == -1:
+                    if d > 0:
+                        k_boundary = k
+                    else:
+                        k_boundary = k_prev
+                    phi_c = phi_d + k_boundary * _PI
+                    frac = (phi_c - ph_prev) / (q1[3] - ph_prev)
+                    r_hit = r_prev + (q1[1] - r_prev) * frac
+                    n_cross += 1
+                    if r_hit >= disk_r_in and r_hit <= disk_r_out:
+                        out_hit[i, 0] = r_hit
+                        out_hit[i, 1] = phi_c
+                        st = 4
+                        break
+    if st == 0:
+        # Budget exhausted: a boundary crossed on the last permitted step still counts.
+        if q1[1] <= 1.1 * rs:
+            st = 1
+        elif q1[1] >= r_max:
+            st = 2
+    for a in range(4):
+        out_qs[i, a] = q1[a]  # return first copy's position
+    out_status[i] = st
+    out_crossings[i] = n_cross
+
+
+@cuda.jit
+def fantasy_integrate_batch_ord2_disk_full(q0s, p0s, steps, delta, rs, r_max, omega,
+                                           disk_phi, disk_r_in, disk_r_out, out_qs_traj):
+    """fantasy_integrate_batch_ord2_full plus disk-crossing detection: records q1
+    before each step as the old kernel does; a ray that hits the disk stops there and
+    the post-crossing state is written as the next row (when it fits in the `steps`
+    rows). Rows after the last recorded state stay as the caller left them."""
+    i = cuda.grid(1)
+    n = q0s.shape[0]
+    if i >= n:
+        return
+    q1 = cuda.local.array(4, dtype=float64)
+    p1 = cuda.local.array(4, dtype=float64)
+    q2 = cuda.local.array(4, dtype=float64)
+    p2 = cuda.local.array(4, dtype=float64)
+    for a in range(4):
+        q1[a] = q0s[i, a]
+        p1[a] = p0s[i, a]
+        q2[a] = q0s[i, a]
+        p2[a] = p0s[i, a]
+    phi_d = disk_phi[i]
+    detect = math.isfinite(phi_d)
+    for step in range(steps):
+        for a in range(4):
+            out_qs_traj[i, step, a] = q1[a]
+        # stop storing if out of domain
+        if q1[1] <= 1.1 * rs or q1[1] >= r_max:
+            break
+        r_prev = q1[1]
+        ph_prev = q1[3]
+        _fantasy_step_ord2(q1, p1, q2, p2, delta, rs, omega)
+        if detect and step >= 1:
+            a_prev = (ph_prev - phi_d) / _PI
+            a_now = (q1[3] - phi_d) / _PI
+            if math.isfinite(a_prev) and math.isfinite(a_now):
+                k_prev = math.floor(a_prev)
+                k = math.floor(a_now)
+                d = k - k_prev
+                if d == 1 or d == -1:
+                    if d > 0:
+                        k_boundary = k
+                    else:
+                        k_boundary = k_prev
+                    phi_c = phi_d + k_boundary * _PI
+                    frac = (phi_c - ph_prev) / (q1[3] - ph_prev)
+                    r_hit = r_prev + (q1[1] - r_prev) * frac
+                    if r_hit >= disk_r_in and r_hit <= disk_r_out:
+                        if step + 1 < steps:
+                            for a in range(4):
+                                out_qs_traj[i, step + 1, a] = q1[a]
+                        break
+
 # ------------------------- Wrapper class overwrite ---------------------------
 
 # Schwarzschild radius in the units the kernels run in (lengths in units of M).
 _RS_UNIT = 2.0
+
+# Exit status codes written by the disk-aware kernels (integrate_batch's `status`).
+STATUS_STEP_LIMIT = 0
+STATUS_CAPTURED = 1
+STATUS_ESCAPED = 2
+STATUS_DIVERGED = 3  # reserved; not produced by these kernels
+STATUS_DISK = 4
 
 
 class CUDASchwarzschildIntegrator:
@@ -618,6 +770,15 @@ class CUDASchwarzschildIntegrator:
     masses above ~2.5 at the default omega produced captured "escapers".)
 
     `delta` and `r_max` are in the same length unit as the input radii.
+
+    Accretion disk: `integrate_batch` and `integrate_batch_full` take an optional
+    per-ray crossing-line azimuth `disk_phi` (NaN disables detection for that ray;
+    see simulation.disk.Disk.ray_frame) and the disk's radial band `disk_r_in`,
+    `disk_r_out` in the caller's length unit. Detection is only enabled when all three
+    are given. The kernels always run with the disk arguments (an all-NaN `disk_phi`
+    when there is no disk), which leaves the disk-off results bit-identical to the
+    old kernels. Status codes: 0 step limit, 1 captured, 2 escaped, 4 hit the disk
+    (STATUS_* above).
     """
 
     def __init__(self, steps=500, delta=0.2, mass=1.0, omega=1.0, r_max=1e6):
@@ -637,26 +798,52 @@ class CUDASchwarzschildIntegrator:
         p[:, 3] /= self.mass
         return q, p
 
-    def integrate_batch(self, q0s, p0s):
+    def _disk_args(self, n, disk_phi, disk_r_in, disk_r_out):
+        """(disk_phi, r_in, r_out) in units of M; all-NaN azimuths when the disk is
+        incomplete (no band or no azimuths), which disables detection for every ray."""
+        if disk_phi is None or disk_r_in is None or disk_r_out is None:
+            return np.full(n, np.nan, dtype=np.float64), 0.0, 0.0
+        phi = np.array(disk_phi, dtype=np.float64, copy=True)
+        if phi.shape != (n,):
+            raise ValueError(f"disk_phi must have shape ({n},), got {phi.shape}")
+        return phi, disk_r_in / self.mass, disk_r_out / self.mass
+
+    def integrate_batch(self, q0s, p0s, disk_phi=None, disk_r_in=None, disk_r_out=None):
+        """Returns (out_qs, status, hits, crossings): the final (t, r, theta, phi) of the
+        first FANTASY copy, the int32 exit status per ray, the (N, 2) array of
+        (r_hit, phi_hit) for rays with status 4 (NaN otherwise) and the int32 count
+        of disk-plane crossings per ray (0 without a disk). Lengths are scaled back
+        to the caller's unit."""
         q, p = self._to_units_of_m(q0s, p0s)
         n = q.shape[0]
+        phi_d, r_in, r_out = self._disk_args(n, disk_phi, disk_r_in, disk_r_out)
         out_qs = np.zeros((n, 4), dtype=np.float64)
+        status = np.zeros(n, dtype=np.int32)
+        hits = np.full((n, 2), np.nan, dtype=np.float64)
+        crossings = np.zeros(n, dtype=np.int32)
         threads = 32
         blocks = (n + threads - 1) // threads
-        fantasy_integrate_batch_ord2[blocks, threads](
-            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega, out_qs)
+        fantasy_integrate_batch_ord2_disk[blocks, threads](
+            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega,
+            phi_d, r_in, r_out, out_qs, status, hits, crossings)
         out_qs[:, 0] *= self.mass
         out_qs[:, 1] *= self.mass
-        return out_qs, None
+        hits[:, 0] *= self.mass
+        return out_qs, status, hits, crossings
 
-    def integrate_batch_full(self, q0s, p0s):
+    def integrate_batch_full(self, q0s, p0s, disk_phi=None, disk_r_in=None, disk_r_out=None):
+        """The (N, steps, 4) trajectory of (t, r, theta, phi) before each step, as the
+        kernel records it; rows after a ray's exit are zero. A ray that hits the disk
+        ends with the post-crossing state."""
         q, p = self._to_units_of_m(q0s, p0s)
         n = q.shape[0]
+        phi_d, r_in, r_out = self._disk_args(n, disk_phi, disk_r_in, disk_r_out)
         out_qs_traj = np.zeros((n, self.steps, 4), dtype=np.float64)
         threads = 32
         blocks = (n + threads - 1) // threads
-        fantasy_integrate_batch_ord2_full[blocks, threads](
-            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega, out_qs_traj)
+        fantasy_integrate_batch_ord2_disk_full[blocks, threads](
+            q, p, self.steps, self.delta / self.mass, _RS_UNIT, self.r_max / self.mass, self.omega,
+            phi_d, r_in, r_out, out_qs_traj)
         out_qs_traj[:, :, 0] *= self.mass
         out_qs_traj[:, :, 1] *= self.mass
         return out_qs_traj

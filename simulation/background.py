@@ -4,6 +4,8 @@ import numpy as np
 import os
 import random
 from tqdm import tqdm
+from simulation.utils import camera_basis, pixel_positions, ray_directions, vec_norm
+from simulation.disk import disk_pixel
 
 def _in_phi_patch(phi, phi0, phi1):
     """Return True if phi lies on the counter-clockwise arc from phi0 to phi1.
@@ -24,10 +26,17 @@ def save_no_gravity_image_with_background(
     flip_theta=False, flip_phi=False,
     return_sampled_trajectories=False, n_sampled=10,
     override_patch_center=False,
-    cuda=False
+    cuda=False,
+    yaw=0.0, pitch=0.0, roll=0.0,
+    disk=None
 ):
     """
     Save an image using flat-space (no curvature) ray tracing, with optional CUDA acceleration.
+
+    yaw, pitch, roll (radians) turn the camera exactly as in the curved render
+    (simulation.utils.camera_basis). `disk` is an optional simulation.disk.Disk: a
+    straight ray that meets it inside [r_in, r_out] is drawn with the disk's colour at
+    g = 1 (no redshift) instead of the sky, and a sampled trajectory ends there.
     """
     h, w = observer.image_size
     if boundary_radius is None:
@@ -37,24 +46,21 @@ def save_no_gravity_image_with_background(
     out_img = np.zeros((h, w, 3), dtype=np.uint8)
 
     obs_pos = np.array(observer.position)
-    bh_pos = np.zeros(3)  # Assume BH at origin for flat case
-    optical_axis = (bh_pos - obs_pos)
-    optical_axis = optical_axis / np.linalg.norm(optical_axis)
-    up_guess = np.array([0, 0, 1])
-    if np.allclose(np.cross(optical_axis, up_guess), 0):
-        up_guess = np.array([0, 1, 0])
-    # Same basis as the curved renderer (raytracing.py): for the observer on +x this
-    # gives right = +y, up = +z. (cross(up_guess, optical_axis) gave right = -y and
-    # mirrored the no-gravity image.)
-    right = np.cross(optical_axis, up_guess)
-    right = right / np.linalg.norm(right)
-    up_vec = np.cross(right, optical_axis)
-    up_vec = up_vec / np.linalg.norm(up_vec)
+    # Same camera as the curved renderer (raytracing.py): the observer on +x looks
+    # along -x with right = +y, up = +z, turned by yaw, pitch, roll. (An earlier
+    # cross(up_guess, optical_axis) gave right = -y and mirrored the no-gravity image.)
+    optical_axis, right, up_vec = camera_basis(yaw, pitch, roll)
     fov = observer.fov
-    plane_dist = 0.2 * np.linalg.norm(obs_pos)
-    plane_center = obs_pos + optical_axis * plane_dist
-    plane_width = 2 * plane_dist * np.tan(fov/2)
-    plane_height = plane_width * (h/w)
+    pixel_pos_grid = pixel_positions(obs_pos, fov, h, w, optical_axis, right, up_vec)
+
+    def disk_hit_colour(ray_dir):
+        """(hit, colour) of the straight ray on the disk, or (None, None)."""
+        if disk is None:
+            return None, None
+        hit = disk.straight_ray_hit(obs_pos, ray_dir)
+        if hit is None:
+            return None, None
+        return np.array(hit), disk_pixel(1.0, disk.temperature(vec_norm(hit)), disk.peak_temperature)
 
     if not override_patch_center or patch_center_theta is None or patch_center_phi is None:
         opp_pos = -obs_pos
@@ -80,14 +86,7 @@ def save_no_gravity_image_with_background(
 
     if cuda:
         from simulation.cuda_geodesic import cuda_flat_raytrace_with_trajectories
-        # Vectorized ray direction calculation
-        jj, ii = np.meshgrid(np.arange(w), np.arange(h))
-        dx = (jj + 0.5) / w - 0.5
-        dy = (ii + 0.5) / h - 0.5
-        pixel_pos = plane_center[None, None, :] + dx[..., None] * right + dy[..., None] * up_vec
-        ray_dirs = pixel_pos - obs_pos[None, None, :]
-        ray_dirs = ray_dirs / np.linalg.norm(ray_dirs, axis=2, keepdims=True)
-        ray_dirs = ray_dirs.reshape(-1, 3)
+        ray_dirs = ray_directions(obs_pos, pixel_pos_grid).reshape(-1, 3)
         # Prepare sampled_indices as flat indices
         sampled_indices_flat = [i * w + j for (i, j) in sampled_indices] if return_sampled_trajectories else []
         if return_sampled_trajectories and sampled_indices_flat:
@@ -100,14 +99,29 @@ def save_no_gravity_image_with_background(
             from simulation.cuda_geodesic import cuda_flat_raytrace
             out_img_flat = cuda_flat_raytrace(obs_pos, ray_dirs, boundary_radius, patch_center_theta, patch_center_phi, patch_size_theta, patch_size_phi, flip_theta, flip_phi, bg_array)
             out_img = out_img_flat.reshape((h, w, 3))
+        if disk is not None:
+            # The flat kernel knows nothing of the disk: draw its hits on the host.
+            for flat_idx in range(h * w):
+                hit, colour = disk_hit_colour(ray_dirs[flat_idx])
+                if hit is None:
+                    continue
+                i, j = divmod(flat_idx, w)
+                out_img[i, j] = colour
+                if return_sampled_trajectories and flat_idx in sampled_indices_flat:
+                    sampled_trajectories[sampled_indices_flat.index(flat_idx)] = np.linspace(obs_pos, hit, 100)
     else:
         for i in tqdm(range(h), desc='Flat ray tracing', unit='row'):
             for j in range(w):
-                u = (j + 0.5) / w - 0.5
-                v = (i + 0.5) / h - 0.5
-                pixel_pos = plane_center + u * plane_width * right + v * plane_height * up_vec
+                pixel_pos = pixel_pos_grid[i, j]
                 ray_dir = pixel_pos - obs_pos
                 ray_dir = ray_dir / np.linalg.norm(ray_dir)
+                hit, colour = disk_hit_colour(ray_dir)
+                if hit is not None:
+                    # The disk is opaque: the ray ends there, drawn without redshift.
+                    out_img[i, j] = colour
+                    if return_sampled_trajectories and (i, j) in sampled_indices:
+                        sampled_trajectories.append(np.linspace(obs_pos, hit, 100))
+                    continue
                 a = np.dot(ray_dir, ray_dir)
                 b = 2 * np.dot(obs_pos, ray_dir)
                 c = np.dot(obs_pos, obs_pos) - boundary_radius**2

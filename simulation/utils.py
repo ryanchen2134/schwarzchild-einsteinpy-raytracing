@@ -195,3 +195,166 @@ def angles_to_p_sph(alpha, beta, r_obs, *, mass_bh=1.0, normalise=True):
     p_ph = n_phhat * r_obs      # p_φ = r² sin²θ p^φ = r sinθ n_φ̂
 
     return np.array([p_r, p_th, p_ph])
+
+
+# =============================================================================
+# Pure-Python 3-vector helpers (the operation order of the Rust port's coords.rs)
+# =============================================================================
+# These work on plain floats so that the disk physics and the camera basis are
+# computed exactly as the Rust build computes them: no BLAS, no fused multiply-add,
+# every sum left to right.
+
+def vec_add(a, b):
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
+
+def vec_sub(a, b):
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+
+def vec_scale(a, s):
+    return [a[0] * s, a[1] * s, a[2] * s]
+
+
+def vec_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def vec_norm(a):
+    return math.sqrt(vec_dot(a, a))
+
+
+def vec_normalize(a):
+    n = vec_norm(a)
+    return [a[0] / n, a[1] / n, a[2] / n]
+
+
+def vec_cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]]
+
+
+def rot_x(angle):
+    """Right-handed rotation about +x by `angle` (3x3 nested lists).
+
+    rot_x(-beta) brings a ray with direction (dx, dy, dz) into the x-y plane when
+    beta = atan2(dz, dy); rot_x(beta) undoes it.
+    """
+    s = math.sin(angle)
+    c = math.cos(angle)
+    return [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
+
+
+def rotation_about(axis, angle):
+    """Right-handed rotation by `angle` about the unit vector `axis` (Rodrigues)."""
+    s = math.sin(angle)
+    c = math.cos(angle)
+    t = 1.0 - c
+    x, y, z = axis
+    return [
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ]
+
+
+def mat_mul(a, b):
+    """a . b for 3x3 nested lists."""
+    out = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    for i in range(3):
+        for j in range(3):
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]
+    return out
+
+
+def mat_vec(m, v):
+    return [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+
+
+# =============================================================================
+# The pinhole camera: pointing and the image-plane grid
+# =============================================================================
+# The observer sits on the +x axis. Unrotated, the camera looks at the black hole
+# at the origin: optical_axis = -x, right = +y, up = +z. The image plane is
+# PLANE_DIST_FRACTION * |observer| in front of the observer along the optical axis;
+# row i = 0 is the *bottom* row (v = -1/2).
+#
+# Pointing: the camera can turn (pan) but not move, since the equatorial rotation in
+# get_initial_conditions requires the observer on +x. The viewer basis is rotated by
+# three intrinsic angles applied in the order yaw -> pitch -> roll, each right-handed
+# about the named axis of the camera as it then stands:
+#   * yaw, about up: positive turns the view to the observer's left, so the black
+#     hole moves right in the image;
+#   * pitch, about right: positive turns the view up, so the black hole moves down;
+#   * roll, about the optical axis: positive turns the image counter-clockwise as
+#     seen by the viewer.
+# Intrinsic yaw -> pitch -> roll equals the product R_up(yaw) . R_right(pitch)
+# . R_axis(roll) of rotations about the *unrotated* axes (up = +z, right = +y,
+# axis = -x), which is how camera_rotation builds it.
+
+PLANE_DIST_FRACTION = 0.2
+
+
+def camera_rotation(yaw, pitch, roll):
+    """The rotation (3x3 nested lists) that takes the unrotated basis to the pointed one."""
+    r_yaw = rotation_about([0.0, 0.0, 1.0], yaw)
+    r_pitch = rotation_about([0.0, 1.0, 0.0], pitch)
+    r_roll = rotation_about([-1.0, 0.0, 0.0], roll)
+    return mat_mul(r_yaw, mat_mul(r_pitch, r_roll))
+
+
+def camera_basis(yaw=0.0, pitch=0.0, roll=0.0):
+    """(optical_axis, right, up) of the camera turned by yaw, pitch, roll (radians).
+
+    With all angles zero the basis is exactly (-1, 0, 0), (0, 1, 0), (0, 0, 1).
+    """
+    for name, v in (("yaw", yaw), ("pitch", pitch), ("roll", roll)):
+        if not math.isfinite(v):
+            raise ValueError(f"{name} must be finite, got {v}")
+    rot = camera_rotation(float(yaw), float(pitch), float(roll))
+    optical_axis = mat_vec(rot, [-1.0, 0.0, 0.0])
+    right = mat_vec(rot, [0.0, 1.0, 0.0])
+    up = mat_vec(rot, [0.0, 0.0, 1.0])
+    return (np.array(optical_axis, dtype=np.float64),
+            np.array(right, dtype=np.float64),
+            np.array(up, dtype=np.float64))
+
+
+def image_plane(observer_pos, fov, h, w, optical_axis):
+    """(plane_center, plane_width, plane_height) of the image plane."""
+    obs_pos = np.asarray(observer_pos, dtype=np.float64)
+    plane_dist = PLANE_DIST_FRACTION * np.linalg.norm(obs_pos)
+    plane_center = obs_pos + optical_axis * plane_dist
+    plane_width = 2 * plane_dist * np.tan(fov / 2)
+    plane_height = plane_width * (h / w)
+    return plane_center, plane_width, plane_height
+
+
+def pixel_positions(observer_pos, fov, h, w, optical_axis, right, up):
+    """World positions of every pixel centre, shape (h, w, 3); row i counts from the
+    bottom of the image, column j from the left.
+
+    Pixel (i, j) sits at plane_center + u*plane_width*right + v*plane_height*up with
+    u = (j + 0.5)/w - 0.5 and v = (i + 0.5)/h - 0.5, the expression both renderers
+    used before the camera could turn.
+    """
+    plane_center, plane_width, plane_height = image_plane(observer_pos, fov, h, w, optical_axis)
+    positions = np.zeros((h, w, 3), dtype=np.float64)
+    for i in range(h):
+        for j in range(w):
+            u = (j + 0.5) / w - 0.5
+            v = (i + 0.5) / h - 0.5
+            positions[i, j] = plane_center + u * plane_width * right + v * plane_height * up
+    return positions
+
+
+def ray_directions(observer_pos, positions):
+    """Unit vectors from the observer through the given positions (any leading shape)."""
+    obs_pos = np.asarray(observer_pos, dtype=np.float64)
+    dirs = np.asarray(positions, dtype=np.float64) - obs_pos
+    return dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
