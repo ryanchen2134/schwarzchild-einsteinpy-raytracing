@@ -269,7 +269,14 @@ since been ported back into the Python code on `main`.
   mirroring [1e-9]; patch membership on all 720 "method b" cases and texel indices on
   the 264 directions both rules accept; the 16×16 end-to-end photon table (exit radius
   bit for bit, exit direction to 2e-15 [1e-9], every classification) when integrated
-  from the Python momenta;
+  from the Python momenta; and `tests/fixtures/disk_scene.json`, a 16×16 scene with an
+  oblique disk (inclination 55°, azimuth 30°) and a turned camera (yaw 6°, pitch −4°)
+  captured with the Python branch's `tests/gen_disk_fixture.py`: initial conditions
+  and per-ray disk frames agree to 1e-12, and from the Python momenta the scalar and
+  SIMD integrators reproduce every status (a flip is tolerated only on a pixel
+  bordering a different status, at most two per image, since status is a discrete
+  decision; none occur), hit radii to 4e-15 relative, hit azimuths to 4e-16 and `g` to
+  1e-15 [1e-9]; the whole Rust pipeline from the flags alone gives the same;
 - `tests/physics.rs`: closed-form checks that need no reference implementation,
   including the disk: every hit in both CPU backends has a physical `g` that the
   momentum carried to the hit confirms, reversing the normal mirrors the image and

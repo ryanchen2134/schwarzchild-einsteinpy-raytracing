@@ -2,14 +2,17 @@
 //! captured from it under numba's CUDA simulator at commit 7dcfb9f
 //! (`tests/fixtures/`, regenerated with `tests/fixtures/gen_golden.py`).
 
+use schwarzschild_rt::backend::CpuFast;
 use schwarzschild_rt::camera::Camera;
 use schwarzschild_rt::coords::{cartesian_to_spherical, spherical_to_cartesian, TWO_PI};
+use schwarzschild_rt::disk::{redshift, Disk};
 use schwarzschild_rt::flat::render_flat;
 use schwarzschild_rt::initial_conditions::{initial_conditions, null_p_t};
 use schwarzschild_rt::integrator::{
-    integrate, integrate_trajectory, ExitReason, IntegratorSettings, Ray,
+    integrate, integrate_ray, integrate_trajectory, DiskBand, ExitReason, IntegratorSettings, Ray,
 };
 use schwarzschild_rt::integrator_fast::integrate_batch_fast;
+use schwarzschild_rt::render::{render_curved, RenderConfig};
 use schwarzschild_rt::schwarzschild::BlackHole;
 use schwarzschild_rt::shading::{classify, unrotate_hit, Collision};
 use schwarzschild_rt::sky_patch::SkyPatch;
@@ -443,4 +446,268 @@ fn end_to_end_pipeline_matches_python_photon_table() {
     }
     eprintln!("e2e: max |Δr| = {worst_r:e}, max angular Δ = {worst_ang:e}");
     assert!(worst_r < 1e-9 && worst_ang < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Accretion disk and camera pointing against the Python build
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DiskSceneParams {
+    size: usize,
+    fov_deg: f64,
+    observer: [f64; 3],
+    boundary_radius: f64,
+    mass: f64,
+    steps: usize,
+    delta: f64,
+    omega: f64,
+    disk_inclination_deg: f64,
+    disk_azimuth_deg: f64,
+    disk_inner: f64,
+    disk_outer: f64,
+    disk_temperature: f64,
+    yaw_deg: f64,
+    pitch_deg: f64,
+    roll_deg: f64,
+    disk_normal: [f64; 3],
+    r_obs: f64,
+}
+
+#[derive(Deserialize)]
+struct DiskScenePixel {
+    i: usize,
+    j: usize,
+    /// 0 step limit, 1 captured, 2 escaped, 4 disk.
+    status: i32,
+    r_hit: Option<f64>,
+    phi_hit: Option<f64>,
+    g: Option<f64>,
+    plane_crossings: u32,
+    p0: [f64; 4],
+    beta: f64,
+    phi_d: Option<f64>,
+    n_z: f64,
+    q: [f64; 4],
+}
+
+#[derive(Deserialize)]
+struct DiskScene {
+    scene: DiskSceneParams,
+    pixels: Vec<DiskScenePixel>,
+}
+
+fn status_exit(code: i32) -> ExitReason {
+    match code {
+        1 => ExitReason::Captured,
+        2 => ExitReason::Escaped,
+        4 => ExitReason::Disk,
+        _ => ExitReason::StepLimit,
+    }
+}
+
+/// Status is a discrete decision at a floor boundary, so one ulp can flip a pixel on
+/// the edge of the disk or the shadow between the builds. A flip is tolerated only on a
+/// pixel that touches (8-neighbourhood) a pixel of a different Python status, and on at
+/// most two pixels per image; any interior flip fails.
+fn check_status_flips(size: usize, py: &[ExitReason], rust: &[ExitReason], what: &str) -> usize {
+    let mut flips = 0;
+    for i in 0..size {
+        for j in 0..size {
+            let k = i * size + j;
+            if py[k] == rust[k] {
+                continue;
+            }
+            flips += 1;
+            let mut on_boundary = false;
+            for di in -1i64..=1 {
+                for dj in -1i64..=1 {
+                    let (ni, nj) = (i as i64 + di, j as i64 + dj);
+                    if ni < 0 || nj < 0 || ni >= size as i64 || nj >= size as i64 {
+                        continue;
+                    }
+                    if py[ni as usize * size + nj as usize] != py[k] {
+                        on_boundary = true;
+                    }
+                }
+            }
+            assert!(
+                on_boundary,
+                "{what}: pixel ({i},{j}) is {:?} in Rust but {:?} in Python, away from any status boundary",
+                rust[k], py[k]
+            );
+        }
+    }
+    assert!(
+        flips <= 2,
+        "{what}: {flips} status flips (at most 2 allowed on boundary pixels)"
+    );
+    flips
+}
+
+/// A 16×16 scene with an oblique disk (inclination 55°, azimuth 30°) and a turned camera
+/// (yaw 6°, pitch −4°) captured from the Python build (`tests/gen_disk_fixture.py` on the
+/// Python branch, under numba's CUDA simulator). Two comparisons: the integrators and
+/// crossing detection from the Python momenta, and the whole Rust pipeline from the
+/// flags alone.
+#[test]
+fn disk_scene_matches_python() {
+    let fx: DiskScene = load("disk_scene.json");
+    let sc = &fx.scene;
+    let n = sc.size;
+    assert_eq!(fx.pixels.len(), n * n);
+    let bh = BlackHole::new(sc.mass);
+    let normal = Disk::normal_from_angles(
+        sc.disk_inclination_deg.to_radians(),
+        sc.disk_azimuth_deg.to_radians(),
+    );
+    for k in 0..3 {
+        assert!((normal[k] - sc.disk_normal[k]).abs() < 1e-15, "disk normal");
+    }
+    let disk = Disk::new(
+        normal,
+        sc.disk_inner,
+        sc.disk_outer,
+        sc.disk_temperature,
+        sc.mass,
+        sc.r_obs,
+    )
+    .unwrap();
+    let cam = Camera::with_rotation(
+        sc.observer,
+        sc.fov_deg.to_radians(),
+        n,
+        n,
+        sc.yaw_deg.to_radians(),
+        sc.pitch_deg.to_radians(),
+        sc.roll_deg.to_radians(),
+    )
+    .unwrap();
+    let settings =
+        IntegratorSettings::new(sc.steps, sc.delta, sc.omega, sc.boundary_radius, bh.rs())
+            .with_disk(DiskBand {
+                r_in: sc.disk_inner,
+                r_out: sc.disk_outer,
+            });
+    let py_status: Vec<ExitReason> = fx.pixels.iter().map(|p| status_exit(p.status)).collect();
+    assert!(py_status.iter().filter(|e| **e == ExitReason::Disk).count() > 100);
+
+    // 1. Camera, initial conditions and the per-ray disk frame.
+    for p in &fx.pixels {
+        let init = initial_conditions(cam.observer, cam.pixel_position(p.i, p.j), sc.mass);
+        for k in 0..4 {
+            assert!(
+                (init.p0[k] - p.p0[k]).abs() < 1e-12 * p.p0[k].abs().max(1.0),
+                "({},{}) p0[{k}]: {} vs {}",
+                p.i,
+                p.j,
+                init.p0[k],
+                p.p0[k]
+            );
+        }
+        assert!((init.beta - p.beta).abs() < 1e-12, "({},{}) beta", p.i, p.j);
+        let frame = disk.ray_frame(init.beta);
+        assert!((frame.n_z - p.n_z).abs() < 1e-12, "({},{}) n_z", p.i, p.j);
+        match p.phi_d {
+            Some(phi_d) => assert!(
+                (frame.phi_d - phi_d).abs() < 1e-12,
+                "({},{}) phi_d",
+                p.i,
+                p.j
+            ),
+            None => assert!(
+                frame.phi_d.is_nan(),
+                "({},{}) phi_d should be NaN",
+                p.i,
+                p.j
+            ),
+        }
+    }
+
+    // 2. Integration and crossing detection from the Python momenta, both CPU paths.
+    let rays: Vec<Ray> = fx
+        .pixels
+        .iter()
+        .map(|p| {
+            Ray::with_disk(
+                [0.0, sc.r_obs, PI / 2.0, 0.0],
+                p.p0,
+                p.phi_d.unwrap_or(f64::NAN),
+            )
+        })
+        .collect();
+    let scalar: Vec<_> = rays
+        .iter()
+        .map(|r| integrate_ray(r, bh.rs(), &settings))
+        .collect();
+    let fast = integrate_batch_fast(&rays, bh.rs(), &settings, || {});
+    for (label, res) in [("scalar", &scalar), ("simd", &fast)] {
+        let status: Vec<ExitReason> = res.iter().map(|r| r.exit).collect();
+        let flips = check_status_flips(n, &py_status, &status, label);
+        let (mut worst_r, mut worst_phi, mut worst_g, mut worst_q, mut compared) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0);
+        for (p, r) in fx.pixels.iter().zip(res) {
+            if r.exit != status_exit(p.status) {
+                continue;
+            }
+            assert_eq!(
+                r.plane_crossings, p.plane_crossings,
+                "({},{}) crossings",
+                p.i, p.j
+            );
+            worst_q = worst_q.max((r.q[1] - p.q[1]).abs());
+            if r.exit == ExitReason::Disk {
+                let hit = r.disk_hit.unwrap();
+                let (py_r, py_phi, py_g) = (p.r_hit.unwrap(), p.phi_hit.unwrap(), p.g.unwrap());
+                worst_r = worst_r.max((hit.r - py_r).abs() / py_r);
+                worst_phi = worst_phi.max((hit.phi - py_phi).abs());
+                let g = redshift(sc.mass, hit.r, p.p0[0], p.p0[3], p.n_z, sc.r_obs);
+                worst_g = worst_g.max((g - py_g).abs() / py_g);
+                assert!(hit.r >= sc.disk_inner && hit.r <= sc.disk_outer);
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "{label} vs Python: {flips} status flips, {compared} hits compared, max rel |Δr_hit| = {worst_r:e}, |Δφ_hit| = {worst_phi:e}, rel |Δg| = {worst_g:e}, |Δr_final| = {worst_q:e}"
+        );
+        assert!(compared > 100);
+        assert!(worst_r < 1e-9 && worst_phi < 1e-9 && worst_g < 1e-9 && worst_q < 1e-9);
+    }
+
+    // 3. The whole Rust pipeline from the scene parameters alone (camera, initial
+    // conditions, disk frame, integration, shading), through the SIMD backend.
+    let cfg = RenderConfig {
+        camera: cam.clone(),
+        black_hole: bh,
+        boundary_radius: sc.boundary_radius,
+        patch: SkyPatch::full_sky(),
+        integrator: IntegratorSettings::new(
+            sc.steps,
+            sc.delta,
+            sc.omega,
+            sc.boundary_radius,
+            bh.rs(),
+        ),
+        disk: Some(disk),
+        sample_pixels: vec![],
+        max_trajectory_points: 10,
+    };
+    let res = render_curved(&cfg, None, &CpuFast, || {}).unwrap();
+    let status: Vec<ExitReason> = res.photons.iter().map(|p| p.result.exit).collect();
+    let flips = check_status_flips(n, &py_status, &status, "pipeline");
+    let mut worst_g = 0.0f64;
+    let mut compared = 0;
+    for (p, ph) in fx.pixels.iter().zip(&res.photons) {
+        assert_eq!((ph.i, ph.j), (p.i, p.j));
+        if ph.result.exit != status_exit(p.status) {
+            continue;
+        }
+        if let (Some(d), Some(py_g)) = (ph.shaded.disk, p.g) {
+            assert_eq!(ph.shaded.collision, Collision::Disk);
+            worst_g = worst_g.max((d.g - py_g).abs() / py_g);
+            compared += 1;
+        }
+    }
+    eprintln!("pipeline vs Python: {flips} status flips, {compared} hits compared, max rel |Δg| = {worst_g:e}");
+    assert!(compared > 100 && worst_g < 1e-9);
 }
