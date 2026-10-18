@@ -7,7 +7,7 @@ use schwarzschild_rt::coords::{cartesian_to_spherical, spherical_to_cartesian, T
 use schwarzschild_rt::flat::render_flat;
 use schwarzschild_rt::initial_conditions::{initial_conditions, null_p_t};
 use schwarzschild_rt::integrator::{
-    integrate, integrate_trajectory, ExitReason, IntegratorSettings,
+    integrate, integrate_trajectory, ExitReason, IntegratorSettings, Ray,
 };
 use schwarzschild_rt::integrator_fast::integrate_batch_fast;
 use schwarzschild_rt::schwarzschild::BlackHole;
@@ -159,7 +159,7 @@ fn fast_integrator_final_states_match_python() {
     let fin: PyFinal = load("integrator_final.json");
     let rs = BlackHole::new(fin.mass).rs();
     let settings = IntegratorSettings::new(fin.steps, fin.delta, fin.omega, fin.r_max, rs);
-    let rays: Vec<([f64; 4], [f64; 4])> = py.rays.iter().map(|r| (r.q0, r.p0)).collect();
+    let rays: Vec<Ray> = py.rays.iter().map(|r| Ray::new(r.q0, r.p0)).collect();
     let fast = integrate_batch_fast(&rays, rs, &settings, || {});
     let mut worst = [0.0f64; 4];
     for (res, expect) in fast.iter().zip(&fin.q_final) {
@@ -202,7 +202,7 @@ fn integrator_trajectories_match_python_step_by_step_through_the_exit() {
     let mut exits = Vec::new();
     for pyray in &tr.rays {
         let ray = &py.rays[pyray.ray_index];
-        let (traj, res) = integrate_trajectory(ray.q0, ray.p0, rs, &settings);
+        let (traj, res) = integrate_trajectory(&Ray::new(ray.q0, ray.p0), rs, &settings);
         assert_ne!(res.exit, ExitReason::StepLimit, "fixture ray must exit");
         assert_eq!(
             traj.len(),
@@ -309,7 +309,14 @@ struct PyFlat {
 fn flat_hits_match_python_up_to_its_mirrored_camera() {
     let py: PyFlat = load("flat_hits.json");
     let cam = Camera::new(py.observer, py.fov_deg.to_radians(), py.w, py.h).unwrap();
-    let res = render_flat(&cam, py.boundary_radius, &SkyPatch::full_sky(), None, &[]);
+    let res = render_flat(
+        &cam,
+        py.boundary_radius,
+        &SkyPatch::full_sky(),
+        None,
+        None,
+        &[],
+    );
     assert_eq!(py.hits.len(), cam.n_pixels());
     for i in 0..py.h {
         for j in 0..py.w {

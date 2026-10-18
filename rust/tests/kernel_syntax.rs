@@ -22,8 +22,9 @@ static dim3_t threadIdx, blockIdx, blockDim;
 /// The kernel's parameter list, as the host launch in `cuda.rs` pushes it: this is
 /// the only ABI check available without a device, so it includes the types.
 const EXPECTED_SIGNATURE: &str = "fantasy_integrate(real* q1s, real* p1s, real* q2s, real* p2s, \
-int* status, int* n_steps, int n, int steps, int round_steps, \
-real delta, real rs, real r_max, real r_capture, real omega)";
+int* status, int* n_steps, const real* disk_phi, int* crossings, real* hit_r, real* hit_phi, \
+int n, int steps, int round_steps, \
+real delta, real rs, real r_max, real r_capture, real omega, real disk_r_in, real disk_r_out)";
 
 #[test]
 fn cuda_kernel_is_valid_cplusplus() {

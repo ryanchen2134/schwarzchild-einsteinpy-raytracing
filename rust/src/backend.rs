@@ -1,7 +1,7 @@
 //! Where the rays get integrated: the scalar reference, the SIMD fast path, or a
 //! CUDA device.
 
-use crate::integrator::{integrate_batch, IntegrationResult, IntegratorSettings};
+use crate::integrator::{integrate_batch, IntegrationResult, IntegratorSettings, Ray};
 use crate::integrator_fast::integrate_batch_fast;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -18,7 +18,7 @@ pub trait BatchIntegrator: Sync {
     /// device backend may report in batches as launches complete.
     fn integrate_batch(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         rs: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
@@ -35,7 +35,7 @@ impl BatchIntegrator for CpuExact {
 
     fn integrate_batch(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         rs: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
@@ -62,7 +62,7 @@ impl BatchIntegrator for CpuFast {
 
     fn integrate_batch(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         rs: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
@@ -79,7 +79,7 @@ impl BatchIntegrator for crate::cuda::CudaIntegrator {
 
     fn integrate_batch(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         rs: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),

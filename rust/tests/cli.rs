@@ -71,8 +71,14 @@ fn writes_every_output_file_and_shades_from_the_texture() {
     let csv = std::fs::read_to_string(out.join("photon_data.csv")).unwrap();
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(lines.len(), 17);
-    assert_eq!(lines[0].split(',').count(), 18);
-    assert!(lines[0].starts_with("i,j,final_r,final_th,final_ph,collision,h_r,h_theta,h_phi,p0_t,p0_r,p0_th,p0_ph,alpha0,analytic_capture,exit,n_steps,beta"));
+    assert_eq!(lines[0].split(',').count(), 26);
+    assert!(lines[0].starts_with("i,j,final_r,final_th,final_ph,collision,h_r,h_theta,h_phi,p0_t,p0_r,p0_th,p0_ph,alpha0,analytic_capture,exit,n_steps,beta,disk_r,disk_phi,disk_x,disk_y,disk_z,disk_g,disk_temp,plane_crossings"));
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|l| l.ends_with(",nan,nan,nan,nan,nan,nan,nan,0")),
+        "no disk: nan columns, zero crossings"
+    );
     assert!(lines[1..]
         .iter()
         .all(|l| l.contains(",True,") || l.contains(",False,")));
@@ -180,6 +186,95 @@ fn exact_and_simd_backends_agree() {
         let x = std::fs::read(dir.join("fast").join(f)).unwrap();
         let y = std::fs::read(dir.join("exact").join(f)).unwrap();
         assert_eq!(x, y, "{f} differs between the SIMD and the exact backend");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn disk_and_pointing_flags_render_and_are_reported() {
+    let dir = tmp("disk");
+    let out = dir.join("out");
+    let o = run_sized(
+        &out,
+        "12",
+        &[
+            "--disk",
+            "--disk-inclination",
+            "60",
+            "--disk-azimuth",
+            "20",
+            "--disk-temperature",
+            "5000",
+            "--yaw",
+            "4",
+            "--pitch",
+            "-3",
+            "--roll",
+            "10",
+        ],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(err.contains("yaw/pitch/roll 4/-3/10°"), "{err}");
+    assert!(
+        err.contains("disk inclination 60°, azimuth 20°, r 6–20, T_peak 5000 K"),
+        "{err}"
+    );
+    let csv = std::fs::read_to_string(out.join("photon_data.csv")).unwrap();
+    let header: Vec<&str> = csv.lines().next().unwrap().split(',').collect();
+    let col = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    let (c_coll, c_r, c_g, c_x, c_cross) = (
+        col("collision"),
+        col("disk_r"),
+        col("disk_g"),
+        col("disk_x"),
+        col("plane_crossings"),
+    );
+    let mut disk_rows = 0;
+    for line in csv.lines().skip(1) {
+        let f: Vec<&str> = line.split(',').collect();
+        if f[c_coll] == "disk" {
+            disk_rows += 1;
+            let r: f64 = f[c_r].parse().unwrap();
+            let g: f64 = f[c_g].parse().unwrap();
+            let _x: f64 = f[c_x].parse().unwrap();
+            assert!(
+                (6.0..=20.0).contains(&r) && g > 0.0 && g.is_finite(),
+                "{line}"
+            );
+            assert!(f[c_cross].parse::<u32>().unwrap() >= 1);
+        } else {
+            assert_eq!(f[c_r], "nan");
+        }
+    }
+    assert!(disk_rows > 10, "{disk_rows} disk rows\n{csv}");
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains(&format!("Hit disk:         {disk_rows}")),
+        "{stdout}"
+    );
+    let img = image::open(out.join("manual_output.png"))
+        .unwrap()
+        .to_rgb8();
+    assert!(img.pixels().filter(|p| p.0 != [0, 0, 0]).count() >= disk_rows);
+    let flat = image::open(out.join("no_gravity.png")).unwrap().to_rgb8();
+    assert!(
+        flat.pixels().any(|p| p.0 != [0, 0, 0]),
+        "the reference render draws the disk too"
+    );
+    // Bad disk and pointing flags fail with a message naming the problem.
+    for (args, needle) in [
+        (vec!["--disk", "--disk-inner", "5"], "inner radius"),
+        (vec!["--disk", "--disk-outer", "30"], "outer radius"),
+        (
+            vec!["--disk", "--disk-inclination", "200"],
+            "--disk-inclination",
+        ),
+        (vec!["--yaw", "nan"], "--yaw"),
+    ] {
+        let o = run(&dir.join("bad"), &args);
+        assert!(!o.status.success(), "{args:?} should fail");
+        assert!(stderr(&o).contains(needle), "{args:?}: {}", stderr(&o));
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

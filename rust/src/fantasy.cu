@@ -12,9 +12,17 @@
 // GPUs kill long kernels) and report progress between rounds.
 //
 // Exit status codes match integrator::ExitReason: 0 still running / step limit,
-// 1 captured, 2 escaped, 3 diverged.
+// 1 captured, 2 escaped, 3 diverged, 4 hit the accretion disk.
+//
+// Disk crossings (integrator.rs, "Disk crossings"): a ray whose disk_phi is finite
+// is checked after every step from the second on for a change of exactly one in
+// floor((phi - disk_phi)/pi); the crossing radius is interpolated linearly in phi,
+// counted, and ends the ray when it lies in [disk_r_in, disk_r_out]. The arithmetic
+// and its order match CrossingDetector::check so that hits are bit-identical.
 
 typedef double real;
+
+#define PI_D 3.141592653589793
 
 __device__ __forceinline__ void metric_diag(const real* q, real rs, real* g)
 {
@@ -131,9 +139,15 @@ __device__ __forceinline__ int exit_reason(const real* q1, const real* q2, real 
 // q1s, p1s, q2s, p2s: both phase-space copies, 4 doubles per ray, read and written.
 // status, n_steps: per ray, read and written. A ray with status != 0 or
 // n_steps >= steps is finished and left untouched.
+// disk_phi: per ray, the crossing-line azimuth, NaN for no detection (read only).
+// crossings: per ray, plane crossings so far (read and written).
+// hit_r, hit_phi: per ray, written when status becomes 4.
 extern "C" __global__ void fantasy_integrate(real* q1s, real* p1s, real* q2s, real* p2s,
-                                             int* status, int* n_steps, int n, int steps, int round_steps,
-                                             real delta, real rs, real r_max, real r_capture, real omega)
+                                             int* status, int* n_steps,
+                                             const real* disk_phi, int* crossings, real* hit_r, real* hit_phi,
+                                             int n, int steps, int round_steps,
+                                             real delta, real rs, real r_max, real r_capture, real omega,
+                                             real disk_r_in, real disk_r_out)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -151,13 +165,38 @@ extern "C" __global__ void fantasy_integrate(real* q1s, real* p1s, real* q2s, re
     const real half = 0.5 * delta;
     real sin_m, cos_m;
     sincos(2.0 * omega * delta, &sin_m, &cos_m);
+    const real phi_d = disk_phi[i];
+    const bool detect = isfinite(phi_d);
+    int n_cross = crossings[i];
 
     int st = 0;
     const int end = (steps - done < round_steps) ? steps : done + round_steps;
     for (; done < end; ++done) {
         st = exit_reason(q1, q2, rs, r_capture, r_max);
         if (st != 0) break;
+        const real r_prev = q1[1];
+        const real ph_prev = q1[3];
         fantasy_step(q1, p1, q2, p2, half, rs, cos_m, sin_m);
+        // done counts the steps before this one: check from the second step on.
+        if (detect && done >= 1) {
+            const real k_prev = floor((ph_prev - phi_d) / PI_D);
+            const real k = floor((q1[3] - phi_d) / PI_D);
+            const real d = k - k_prev;
+            if (d == 1.0 || d == -1.0) {
+                const real k_boundary = (d > 0.0) ? k : k_prev;
+                const real phi_c = phi_d + k_boundary * PI_D;
+                const real frac = (phi_c - ph_prev) / (q1[3] - ph_prev);
+                const real r_hit = r_prev + (q1[1] - r_prev) * frac;
+                ++n_cross;
+                if (r_hit >= disk_r_in && r_hit <= disk_r_out) {
+                    hit_r[i] = r_hit;
+                    hit_phi[i] = phi_c;
+                    st = 4;
+                    ++done;
+                    break;
+                }
+            }
+        }
     }
     if (st == 0 && done >= steps) {
         // Budget exhausted: a boundary crossed on the last permitted step still counts.
@@ -171,4 +210,5 @@ extern "C" __global__ void fantasy_integrate(real* q1s, real* p1s, real* q2s, re
     }
     status[i] = st;
     n_steps[i] = done;
+    crossings[i] = n_cross;
 }

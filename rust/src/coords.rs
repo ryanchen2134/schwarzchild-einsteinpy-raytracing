@@ -76,6 +76,31 @@ pub fn rot_x(angle: f64) -> Mat3 {
     [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
 }
 
+/// Right-handed rotation by `angle` about the unit vector `axis` (Rodrigues).
+#[inline]
+pub fn rotation_about(axis: Vec3, angle: f64) -> Mat3 {
+    let (s, c) = angle.sin_cos();
+    let t = 1.0 - c;
+    let [x, y, z] = axis;
+    [
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ]
+}
+
+/// `a · b`.
+#[inline]
+pub fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
+    let mut out = [[0.0; 3]; 3];
+    for (i, row) in out.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
 #[inline]
 pub fn mat_vec(m: &Mat3, v: Vec3) -> Vec3 {
     [
@@ -127,6 +152,35 @@ mod tests {
         let back = mat_vec(&rot_x(beta), flat);
         for k in 0..3 {
             assert!((back[k] - v[k]).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn rotation_about_x_matches_rot_x_and_composes() {
+        let a = 0.7;
+        let r1 = rotation_about([1.0, 0.0, 0.0], a);
+        let r2 = rot_x(a);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((r1[i][j] - r2[i][j]).abs() < 1e-15);
+            }
+        }
+        // Rotating ẑ about ŷ by +90° gives +x̂ (right-handed).
+        let v = mat_vec(
+            &rotation_about([0.0, 1.0, 0.0], std::f64::consts::FRAC_PI_2),
+            [0.0, 0.0, 1.0],
+        );
+        assert!((v[0] - 1.0).abs() < 1e-15 && v[1].abs() < 1e-15 && v[2].abs() < 1e-15);
+        // Two rotations about the same axis add.
+        let m = mat_mul(
+            &rotation_about([0.0, 0.0, 1.0], 0.4),
+            &rotation_about([0.0, 0.0, 1.0], 0.3),
+        );
+        let n = rotation_about([0.0, 0.0, 1.0], 0.7);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((m[i][j] - n[i][j]).abs() < 1e-15);
+            }
         }
     }
 

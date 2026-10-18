@@ -14,9 +14,13 @@
 //! and the host relaunches until every ray has exited or used its budget: no
 //! single kernel runs long enough to trip a display GPU's watchdog, and progress is
 //! reported between rounds.
+//!
+//! Disk crossings are detected in the kernel with the arithmetic of
+//! [`crate::integrator::CrossingDetector`]; the crossing count and the hit live in
+//! their own buffers so that a ray's detection state survives relaunches.
 
 use crate::backend::CUDA_KERNEL_SOURCE as KERNEL_SOURCE;
-use crate::integrator::{ExitReason, IntegrationResult, IntegratorSettings};
+use crate::integrator::{DiskHit, ExitReason, IntegrationResult, IntegratorSettings, Ray};
 use anyhow::{anyhow, bail, Context, Result};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
@@ -160,7 +164,7 @@ impl CudaIntegrator {
     /// per ray, as rays finish between launches.
     pub fn integrate_batch(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         rs: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
@@ -175,7 +179,7 @@ impl CudaIntegrator {
 
     fn integrate_chunk(
         &self,
-        rays: &[([f64; 4], [f64; 4])],
+        rays: &[Ray],
         mass: f64,
         settings: &IntegratorSettings,
         on_ray_done: &(dyn Fn() + Sync),
@@ -183,10 +187,22 @@ impl CudaIntegrator {
         let n = rays.len();
         let mut q_host = Vec::with_capacity(4 * n);
         let mut p_host = Vec::with_capacity(4 * n);
-        for (q, p) in rays {
+        let mut phi_host = Vec::with_capacity(n);
+        for ray in rays {
+            let (q, p) = (ray.q0, ray.p0);
             q_host.extend_from_slice(&[q[0] / mass, q[1] / mass, q[2], q[3]]);
             p_host.extend_from_slice(&[p[0], p[1], p[2] / mass, p[3] / mass]);
+            // Without a band no ray detects crossings, whatever azimuth it carries.
+            phi_host.push(if settings.disk.is_some() {
+                ray.disk_phi
+            } else {
+                f64::NAN
+            });
         }
+        let (disk_r_in, disk_r_out) = match settings.disk {
+            Some(band) => (band.r_in / mass, band.r_out / mass),
+            None => (0.0, 0.0),
+        };
         let stream = &self.stream;
         let mut q1 = stream
             .memcpy_stod(&q_host)
@@ -205,6 +221,18 @@ impl CudaIntegrator {
             .context("allocating device buffers")?;
         let mut n_steps = stream
             .alloc_zeros::<i32>(n)
+            .context("allocating device buffers")?;
+        let disk_phi = stream
+            .memcpy_stod(&phi_host)
+            .context("copying disk azimuths to the device")?;
+        let mut crossings = stream
+            .alloc_zeros::<i32>(n)
+            .context("allocating device buffers")?;
+        let mut hit_r = stream
+            .alloc_zeros::<f64>(n)
+            .context("allocating device buffers")?;
+        let mut hit_phi = stream
+            .alloc_zeros::<f64>(n)
             .context("allocating device buffers")?;
 
         let n_i32 = i32::try_from(n).context("too many rays for one launch")?;
@@ -232,6 +260,10 @@ impl CudaIntegrator {
                 .arg(&mut p2)
                 .arg(&mut status)
                 .arg(&mut n_steps)
+                .arg(&disk_phi)
+                .arg(&mut crossings)
+                .arg(&mut hit_r)
+                .arg(&mut hit_phi)
                 .arg(&n_i32)
                 .arg(&steps_i32)
                 .arg(&round_i32)
@@ -239,10 +271,14 @@ impl CudaIntegrator {
                 .arg(&rs_unit)
                 .arg(&r_max)
                 .arg(&r_capture)
-                .arg(&omega);
+                .arg(&omega)
+                .arg(&disk_r_in)
+                .arg(&disk_r_out);
             // SAFETY: the argument list matches the kernel signature in fantasy.cu
             // (four read/write ray buffers of 4n doubles, two read/write int buffers
-            // of n, three ints, five doubles), and the kernel guards i < n.
+            // of n, one read-only double buffer of n, one read/write int buffer and
+            // two read/write double buffers of n, three ints, seven doubles), and the
+            // kernel guards i < n.
             unsafe { launch.launch(cfg) }.context("kernel launch failed")?;
             let st = stream
                 .memcpy_dtov(&status)
@@ -272,6 +308,13 @@ impl CudaIntegrator {
         let ns = stream
             .memcpy_dtov(&n_steps)
             .context("reading results back")?;
+        let cross = stream
+            .memcpy_dtov(&crossings)
+            .context("reading results back")?;
+        let hr = stream.memcpy_dtov(&hit_r).context("reading results back")?;
+        let hp = stream
+            .memcpy_dtov(&hit_phi)
+            .context("reading results back")?;
         stream.synchronize().context("waiting for the device")?;
         for _ in finished..n {
             on_ray_done();
@@ -295,9 +338,15 @@ impl CudaIntegrator {
                     1 => ExitReason::Captured,
                     2 => ExitReason::Escaped,
                     3 => ExitReason::Diverged,
+                    4 => ExitReason::Disk,
                     _ => ExitReason::StepLimit,
                 },
                 n_steps: ns[i].max(0) as usize,
+                disk_hit: (st[i] == 4).then(|| DiskHit {
+                    r: hr[i] * mass,
+                    phi: hp[i],
+                }),
+                plane_crossings: cross[i].max(0) as u32,
             })
             .collect())
     }

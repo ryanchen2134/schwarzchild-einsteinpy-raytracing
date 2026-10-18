@@ -2,6 +2,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use schwarzschild_rt::backend::{cuda_compiled_in, try_cuda, BatchIntegrator, CpuExact, CpuFast};
 use schwarzschild_rt::camera::Camera;
+use schwarzschild_rt::disk::Disk;
 use schwarzschild_rt::flat::render_flat;
 use schwarzschild_rt::integrator::IntegratorSettings;
 use schwarzschild_rt::output::{summarize, write_photon_csv, write_png, write_trajectories_csv};
@@ -118,6 +119,75 @@ struct Args {
     /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     cuda_device: usize,
+    /// Camera yaw in degrees, a right-handed turn about the camera's up axis: positive
+    /// looks to the observer's left, so the black hole moves right in the image. The
+    /// camera pans; it never moves off the +x axis.
+    #[arg(long, default_value_t = 0.0)]
+    yaw: f64,
+    /// Camera pitch in degrees, about the camera's right axis after the yaw: positive
+    /// looks up, so the black hole moves down in the image.
+    #[arg(long, default_value_t = 0.0)]
+    pitch: f64,
+    /// Camera roll in degrees about the optical axis after yaw and pitch: positive
+    /// turns the image counter-clockwise.
+    #[arg(long, default_value_t = 0.0)]
+    roll: f64,
+    /// Render a thin, opaque, Keplerian accretion disk (README, "Accretion disk").
+    #[arg(long)]
+    disk: bool,
+    /// Angle in degrees between the disk normal and the observer's position vector +x:
+    /// 0 face-on, 90 edge-on, 180 face-on with the opposite sense of rotation. Measured
+    /// against the observer's position, not the optical axis.
+    #[arg(long, default_value_t = 75.0)]
+    disk_inclination: f64,
+    /// Right-handed rotation of the disk normal about +x, in degrees. At 0 the near side
+    /// of an inclined disk is below the black hole and, edge-on, the left side approaches.
+    #[arg(long, default_value_t = 0.0)]
+    disk_azimuth: f64,
+    /// Inner radius of the disk, in the same length unit as the other radii. Defaults to
+    /// the ISCO, 6M, and may not be smaller.
+    #[arg(long)]
+    disk_inner: Option<f64>,
+    /// Outer radius of the disk (default 20M); must stay below --observer-distance.
+    #[arg(long)]
+    disk_outer: Option<f64>,
+    /// Peak effective temperature of the disk in kelvin. A false-colour parameter: it
+    /// sets the hue, not the physics.
+    #[arg(long, default_value_t = 6000.0)]
+    disk_temperature: f64,
+}
+
+/// The disk the flags describe, if `--disk` is set.
+fn build_disk(args: &Args) -> Result<Option<Disk>> {
+    if !args.disk {
+        return Ok(None);
+    }
+    ensure!(
+        args.disk_inclination.is_finite() && (0.0..=180.0).contains(&args.disk_inclination),
+        "--disk-inclination must be in [0, 180] degrees, got {}",
+        args.disk_inclination
+    );
+    ensure!(
+        args.disk_azimuth.is_finite(),
+        "--disk-azimuth must be finite, got {}",
+        args.disk_azimuth
+    );
+    let normal = Disk::normal_from_angles(
+        args.disk_inclination.to_radians(),
+        args.disk_azimuth.to_radians(),
+    );
+    let r_in = args.disk_inner.unwrap_or(6.0 * args.bh_mass);
+    let r_out = args.disk_outer.unwrap_or(20.0 * args.bh_mass);
+    Disk::new(
+        normal,
+        r_in,
+        r_out,
+        args.disk_temperature,
+        args.bh_mass,
+        args.observer_distance,
+    )
+    .map(Some)
+    .context("--disk-inner / --disk-outer / --disk-temperature")
 }
 
 fn validate(args: &Args) -> Result<()> {
@@ -170,6 +240,17 @@ fn validate(args: &Args) -> Result<()> {
             "--exact selects the scalar CPU integrator; it cannot be combined with --backend cuda"
         );
     }
+    for (name, v) in [
+        ("--yaw", args.yaw),
+        ("--pitch", args.pitch),
+        ("--roll", args.roll),
+    ] {
+        ensure!(
+            v.is_finite(),
+            "{name} must be a finite angle in degrees, got {v}"
+        );
+    }
+    build_disk(args)?;
     Ok(())
 }
 
@@ -217,13 +298,17 @@ fn main() -> Result<()> {
             .build_global()?;
     }
 
-    let camera = Camera::new(
+    let camera = Camera::with_rotation(
         [args.observer_distance, 0.0, 0.0],
         args.fov.to_radians(),
         args.size,
         args.size,
+        args.yaw.to_radians(),
+        args.pitch.to_radians(),
+        args.roll.to_radians(),
     )?;
     let bh = BlackHole::new(args.bh_mass);
+    let disk = build_disk(&args)?;
     let patch = SkyPatch::from_degrees(
         args.bg_patch_center_theta,
         args.bg_patch_center_phi,
@@ -254,10 +339,13 @@ fn main() -> Result<()> {
 
     let n = camera.n_pixels();
     eprintln!(
-        "{}×{} rays, fov {}°, observer at r = {}, M = {}, steps ≤ {}, δ = {}, ω = {}, texture {}, backend {}",
+        "{}×{} rays, fov {}°, yaw/pitch/roll {}/{}/{}°, observer at r = {}, M = {}, steps ≤ {}, δ = {}, ω = {}, texture {}, disk {}, backend {}",
         args.size,
         args.size,
         args.fov,
+        args.yaw,
+        args.pitch,
+        args.roll,
         args.observer_distance,
         args.bh_mass,
         args.steps,
@@ -266,6 +354,10 @@ fn main() -> Result<()> {
         texture
             .as_ref()
             .map_or("none".to_string(), |t| format!("{}×{}", t.width, t.height)),
+        disk.as_ref().map_or("none".to_string(), |d| format!(
+            "inclination {}°, azimuth {}°, r {}–{}, T_peak {} K",
+            args.disk_inclination, args.disk_azimuth, d.r_in, d.r_out, d.peak_temperature
+        )),
         backend.name()
     );
 
@@ -276,6 +368,7 @@ fn main() -> Result<()> {
             args.boundary_radius,
             &patch,
             texture.as_ref(),
+            disk.as_ref(),
             &sample_pixels,
         );
         write_png(
@@ -300,6 +393,7 @@ fn main() -> Result<()> {
             args.boundary_radius,
             bh.rs(),
         ),
+        disk,
         sample_pixels,
         max_trajectory_points: args.max_trajectory_points,
     };
@@ -329,6 +423,7 @@ fn main() -> Result<()> {
     println!("  Still in domain:  {}", s.in_domain);
     println!("  Escaped:          {}", s.escaped());
     println!("  Hit background:   {}", s.escaped_background);
+    println!("  Hit disk:         {}", s.disk);
     println!("  Numerical error:  {}", s.numerical_error);
     println!("Outputs in {}", args.out_dir.display());
     Ok(())
@@ -419,5 +514,46 @@ mod tests {
             "62"
         ]))
         .is_ok());
+    }
+
+    #[test]
+    fn disk_and_pointing_flags_are_validated() {
+        assert!(validate(&parse(&["--disk"])).is_ok());
+        assert!(validate(&parse(&["--yaw", "-15", "--pitch", "10", "--roll", "400"])).is_ok());
+        let d = build_disk(&parse(&[
+            "--disk",
+            "--bh-mass",
+            "2",
+            "--observer-distance",
+            "60",
+            "--boundary-radius",
+            "62",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (d.r_in, d.r_out),
+            (12.0, 40.0),
+            "defaults scale with the mass"
+        );
+        assert!(build_disk(&parse(&[])).unwrap().is_none());
+        for bad in [
+            vec!["--disk", "--disk-inner", "5.9"],
+            vec!["--disk", "--disk-outer", "30"],
+            vec!["--disk", "--disk-inner", "10", "--disk-outer", "10"],
+            vec!["--disk", "--disk-temperature", "0"],
+            vec!["--disk", "--disk-inclination", "181"],
+            vec!["--disk", "--disk-inclination", "-1"],
+            vec!["--disk", "--disk-azimuth", "nan"],
+            vec!["--yaw", "nan"],
+            vec!["--pitch", "inf"],
+        ] {
+            assert!(
+                validate(&parse(&bad)).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Without --disk the disk flags are inert.
+        assert!(validate(&parse(&["--disk-inner", "1"])).is_ok());
     }
 }

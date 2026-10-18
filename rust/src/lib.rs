@@ -17,6 +17,7 @@ pub mod camera;
 pub mod coords;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod disk;
 pub mod flat;
 pub mod initial_conditions;
 pub mod integrator;

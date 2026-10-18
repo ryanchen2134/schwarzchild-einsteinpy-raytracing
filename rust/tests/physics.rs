@@ -186,3 +186,207 @@ fn pixel_rays_scale_with_mass() {
         "p_φ carries one length"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Accretion disk and camera pointing
+// ---------------------------------------------------------------------------
+
+use schwarzschild_rt::backend::{BatchIntegrator, CpuExact, CpuFast};
+use schwarzschild_rt::camera::Camera;
+use schwarzschild_rt::disk::{keplerian_omega, redshift, Disk};
+use schwarzschild_rt::render::{render_curved, RenderConfig, RenderResult};
+use schwarzschild_rt::shading::Collision;
+use schwarzschild_rt::sky_patch::SkyPatch;
+
+fn disk_scene(
+    size: usize,
+    inclination_deg: f64,
+    azimuth_deg: f64,
+    (yaw, pitch, roll): (f64, f64, f64),
+) -> RenderConfig {
+    let bh = BlackHole::new(1.0);
+    let camera = Camera::with_rotation(
+        [30.0, 0.0, 0.0],
+        80f64.to_radians(),
+        size,
+        size,
+        yaw.to_radians(),
+        pitch.to_radians(),
+        roll.to_radians(),
+    )
+    .unwrap();
+    let normal = Disk::normal_from_angles(inclination_deg.to_radians(), azimuth_deg.to_radians());
+    RenderConfig {
+        camera,
+        black_hole: bh,
+        boundary_radius: 31.0,
+        patch: SkyPatch::full_sky(),
+        integrator: IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, bh.rs()),
+        disk: Some(Disk::new(normal, 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap()),
+        sample_pixels: vec![],
+        max_trajectory_points: 10,
+    }
+}
+
+fn render(cfg: &RenderConfig, backend: &dyn BatchIntegrator) -> RenderResult {
+    render_curved(cfg, None, backend, || {}).unwrap()
+}
+
+/// Every disk hit, in every integrator, must give a physical redshift, and `g`
+/// recomputed from the momentum the integrator actually carried to the hit must
+/// agree with the closed form from the conserved initial momenta.
+#[test]
+fn every_disk_hit_has_a_physical_redshift_that_the_integrated_momentum_confirms() {
+    let cfg = disk_scene(21, 55.0, 30.0, (6.0, -4.0, 0.0));
+    let disk = cfg.disk.as_ref().unwrap();
+    for backend in [&CpuExact as &dyn BatchIntegrator, &CpuFast] {
+        let res = render(&cfg, backend);
+        let mut hits = 0;
+        let (mut g_min, mut g_max) = (f64::INFINITY, 0.0f64);
+        for p in &res.photons {
+            if p.shaded.collision == Collision::NumericalError {
+                panic!("numerical error at ({}, {}): {:?}", p.i, p.j, p.shaded.disk);
+            }
+            let Some(d) = p.shaded.disk else { continue };
+            hits += 1;
+            assert_eq!(p.shaded.collision, Collision::Disk);
+            assert!(d.g.is_finite() && d.g > 0.0);
+            let frame = disk.ray_frame(p.init.beta);
+            let b_z = -p.init.p0[3] * frame.n_z / p.init.p0[0];
+            assert!(
+                1.0 - keplerian_omega(1.0, d.r) * b_z > 0.0,
+                "1 − Ω b_z must be positive"
+            );
+            // Contraction with the momentum at the hit (p_t, p_φ drift at the scheme's
+            // second-order level) against the closed form from the initial momenta.
+            let g_hit = redshift(1.0, d.r, p.result.p[0], p.result.p[3], frame.n_z, 30.0);
+            assert!(
+                (g_hit - d.g).abs() < 1e-4 * d.g,
+                "({}, {}): {g_hit} vs {}",
+                p.i,
+                p.j,
+                d.g
+            );
+            // The hit lies in the disk plane and in the band.
+            assert!(schwarzschild_rt::coords::dot(disk.normal, d.position).abs() < 1e-9);
+            assert!((6.0..=20.0).contains(&d.r));
+            g_min = g_min.min(d.g);
+            g_max = g_max.max(d.g);
+        }
+        assert!(hits > 60, "{hits} hits with {}", backend.name());
+        assert!(
+            g_max > 1.0 && g_min < 0.9,
+            "Doppler both ways: g in [{g_min}, {g_max}]"
+        );
+    }
+}
+
+/// Reversing the normal reverses the sense of rotation: for an edge-on disk the
+/// mirror pixel sees the same hit radius and the same `g`.
+#[test]
+fn reversing_the_disk_normal_mirrors_the_image() {
+    let n = 21;
+    let a = render(&disk_scene(n, 90.0, 0.0, (0.0, 0.0, 0.0)), &CpuExact);
+    let b = render(&disk_scene(n, 90.0, 180.0, (0.0, 0.0, 0.0)), &CpuExact);
+    let mut compared = 0;
+    for i in 0..n {
+        for j in 0..n {
+            let pa = &a.photons[i * n + j];
+            let pb = &b.photons[i * n + (n - 1 - j)];
+            assert_eq!(pa.shaded.collision, pb.shaded.collision, "({i},{j})");
+            if let (Some(da), Some(db)) = (pa.shaded.disk, pb.shaded.disk) {
+                assert!(
+                    (da.r - db.r).abs() < 1e-9 && (da.g - db.g).abs() < 1e-9,
+                    "({i},{j})"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 15, "{compared}");
+    // And the left side approaches for the +ẑ normal (azimuth 0): its Doppler factor
+    // lifts g above the purely gravitational value at the same radius, the right side's
+    // lowers it below. (g itself can be below 1 on both sides near the inner edge, where
+    // the gravitational redshift wins.)
+    let gravitational = |r: f64| (1.0 - 3.0 / r).sqrt() / (1.0 - 2.0 / 30.0f64).sqrt();
+    let side = |left: bool| -> Vec<(f64, f64)> {
+        a.photons
+            .iter()
+            .filter(|p| if left { p.j < n / 2 } else { p.j > n / 2 })
+            .filter_map(|p| p.shaded.disk.map(|d| (d.g, gravitational(d.r))))
+            .collect()
+    };
+    let (left, right) = (side(true), side(false));
+    assert!(!left.is_empty() && !right.is_empty());
+    assert!(left.iter().all(|(g, g0)| g > g0), "{left:?}");
+    assert!(right.iter().all(|(g, g0)| g < g0), "{right:?}");
+}
+
+/// Rotating the scene about the x axis is an exact symmetry with the observer fixed:
+/// a disk at azimuth α seen by an unrolled camera is the disk at azimuth 0 seen by a
+/// camera rolled by α. Pins the disk's azimuth handedness against the camera's roll.
+#[test]
+fn disk_azimuth_and_camera_roll_are_the_same_rotation() {
+    let n = 21;
+    let a = render(&disk_scene(n, 55.0, 30.0, (0.0, 0.0, 0.0)), &CpuFast);
+    let b = render(&disk_scene(n, 55.0, 0.0, (0.0, 0.0, 30.0)), &CpuFast);
+    let mut compared = 0;
+    for (pa, pb) in a.photons.iter().zip(&b.photons) {
+        assert_eq!(
+            pa.shaded.collision, pb.shaded.collision,
+            "({}, {})",
+            pa.i, pa.j
+        );
+        if let (Some(da), Some(db)) = (pa.shaded.disk, pb.shaded.disk) {
+            assert!(
+                (da.r - db.r).abs() < 1e-9 && (da.g - db.g).abs() < 1e-9,
+                "({}, {})",
+                pa.i,
+                pa.j
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 60, "{compared}");
+    // The rotation is not a no-op: azimuth 30 differs from azimuth 0 unrolled.
+    let c = render(&disk_scene(n, 55.0, 0.0, (0.0, 0.0, 0.0)), &CpuFast);
+    assert!(a
+        .photons
+        .iter()
+        .zip(&c.photons)
+        .any(|(x, y)| x.shaded.collision != y.shaded.collision));
+}
+
+/// Turning the camera moves the hole and the disk together: the pixel directions of a
+/// yawed/pitched camera are the rigid rotation of the unrotated ones, so a rotated render
+/// contains the same scene content as the unrotated render read at the rotated directions.
+#[test]
+fn a_turned_camera_sees_the_same_scene_from_the_same_place() {
+    // Yaw by exactly the angle of a pixel column in a narrow, finely sampled view is not
+    // a pixel permutation (pinhole tangents), so compare through the closed form instead:
+    // every disk hit in the turned view obeys the same g(r, β, p) relation, and the
+    // hole stays where the camera test says it goes.
+    let n = 21;
+    let cfg = disk_scene(n, 0.0, 0.0, (20.0, 0.0, 0.0));
+    let res = render(&cfg, &CpuExact);
+    let captured: Vec<(usize, usize)> = res
+        .photons
+        .iter()
+        .filter(|p| p.shaded.collision == Collision::BlackHole)
+        .map(|p| (p.i, p.j))
+        .collect();
+    assert!(!captured.is_empty());
+    assert!(
+        captured.iter().all(|&(_, j)| j > n / 2),
+        "yaw left moves the hole right: {captured:?}"
+    );
+    for p in &res.photons {
+        if let Some(d) = p.shaded.disk {
+            let expect = (1.0 - 3.0 / d.r).sqrt() / (1.0 - 2.0 / 30.0f64).sqrt();
+            assert!(
+                (d.g - expect).abs() < 1e-14,
+                "face-on g is pointing-independent"
+            );
+        }
+    }
+}

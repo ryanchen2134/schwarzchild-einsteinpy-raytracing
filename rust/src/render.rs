@@ -4,10 +4,13 @@
 use crate::backend::BatchIntegrator;
 use crate::camera::Camera;
 use crate::coords::{mat_vec, rot_x, spherical_to_cartesian, Vec3};
+use crate::disk::Disk;
 use crate::initial_conditions::{initial_conditions, RayInit};
-use crate::integrator::{integrate_trajectory_bounded, IntegrationResult, IntegratorSettings};
+use crate::integrator::{
+    integrate_trajectory_bounded, DiskBand, IntegrationResult, IntegratorSettings, Ray,
+};
 use crate::schwarzschild::BlackHole;
-use crate::shading::{shade, ShadedRay};
+use crate::shading::{shade, Scene, ShadedRay};
 use crate::sky_patch::SkyPatch;
 use crate::texture::{Rgb, Texture};
 use anyhow::Result;
@@ -19,11 +22,38 @@ pub struct RenderConfig {
     pub black_hole: BlackHole,
     pub boundary_radius: f64,
     pub patch: SkyPatch,
+    /// Integrator settings; the disk band is filled in from `disk` at render time.
     pub integrator: IntegratorSettings,
+    pub disk: Option<Disk>,
     /// Flat pixel indices whose trajectories are recorded.
     pub sample_pixels: Vec<usize>,
     /// Trajectories are thinned to at most this many points.
     pub max_trajectory_points: usize,
+}
+
+impl RenderConfig {
+    /// The integrator settings with the disk band set from `disk`.
+    pub fn integrator_settings(&self) -> IntegratorSettings {
+        match &self.disk {
+            Some(d) => self.integrator.with_disk(DiskBand {
+                r_in: d.r_in,
+                r_out: d.r_out,
+            }),
+            None => IntegratorSettings {
+                disk: None,
+                ..self.integrator
+            },
+        }
+    }
+
+    /// The ray for pixel `(i, j)`: initial conditions plus the disk's crossing azimuth
+    /// in the ray's frame.
+    pub fn ray(&self, init: &RayInit) -> Ray {
+        match &self.disk {
+            Some(d) => Ray::with_disk(init.q0, init.p0, d.ray_frame(init.beta).phi_d),
+            None => Ray::new(init.q0, init.p0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,8 +129,9 @@ where
         })
         .collect();
 
-    let rays: Vec<([f64; 4], [f64; 4])> = inits.iter().map(|r| (r.q0, r.p0)).collect();
-    let results = backend.integrate_batch(&rays, rs, &cfg.integrator, &on_ray_done)?;
+    let settings = cfg.integrator_settings();
+    let rays: Vec<Ray> = inits.iter().map(|init| cfg.ray(init)).collect();
+    let results = backend.integrate_batch(&rays, rs, &settings, &on_ray_done)?;
     drop(rays);
 
     // Diagnostic trajectories first: they only need `inits`, which the photon
@@ -111,10 +142,9 @@ where
         .map(|&flat| {
             let init = inits[flat];
             let (traj, _) = integrate_trajectory_bounded(
-                init.q0,
-                init.p0,
+                &cfg.ray(&init),
                 rs,
-                &cfg.integrator,
+                &settings,
                 cfg.max_trajectory_points,
             );
             (
@@ -125,20 +155,21 @@ where
         .collect();
 
     let capture_angle = bh.capture_angle(cam.observer_radius());
+    let scene = Scene {
+        black_hole: bh,
+        r_obs: cam.observer_radius(),
+        boundary_radius: cfg.boundary_radius,
+        patch: &cfg.patch,
+        texture,
+        disk: cfg.disk.as_ref(),
+    };
     let photons: Vec<PhotonRecord> = inits
         .into_par_iter()
         .zip(results.into_par_iter())
         .enumerate()
         .map(|(flat, (init, result))| {
             let (i, j) = cam.pixel_of(flat);
-            let shaded = shade(
-                &result,
-                init.beta,
-                rs,
-                cfg.boundary_radius,
-                &cfg.patch,
-                texture,
-            );
+            let shaded = shade(&result, &init, &scene);
             PhotonRecord {
                 i,
                 j,
@@ -164,6 +195,7 @@ where
 mod tests {
     use super::*;
     use crate::backend::{CpuExact, CpuFast};
+    use crate::integrator::ExitReason;
     use crate::shading::Collision;
 
     #[test]
@@ -183,9 +215,87 @@ mod tests {
             boundary_radius: 31.0,
             patch: SkyPatch::full_sky(),
             integrator: IntegratorSettings::new(20_000, 0.01, 0.01, 31.0, bh.rs()),
+            disk: None,
             sample_pixels,
             max_trajectory_points: 50,
         }
+    }
+
+    #[test]
+    fn a_face_on_disk_is_seen_without_doppler_shift_at_any_pointing() {
+        // n = +x̂: b_z ≡ 0, so every disk pixel has g = √(1−3M/r)/√(1−2M/r_obs), even
+        // with the camera turned.
+        let mut cfg = config(15, vec![]);
+        cfg.camera = Camera::with_rotation(
+            [30.0, 0.0, 0.0],
+            80f64.to_radians(),
+            15,
+            15,
+            0.2,
+            -0.15,
+            0.4,
+        )
+        .unwrap();
+        cfg.disk = Some(Disk::new([1.0, 0.0, 0.0], 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap());
+        let res = render_curved(&cfg, None, &CpuExact, || {}).unwrap();
+        let disk_pixels: Vec<_> = res
+            .photons
+            .iter()
+            .filter(|p| p.shaded.collision == Collision::Disk)
+            .collect();
+        assert!(disk_pixels.len() > 30, "{}", disk_pixels.len());
+        for p in &disk_pixels {
+            let d = p.shaded.disk.unwrap();
+            let expect = (1.0 - 3.0 / d.r).sqrt() / (1.0 - 2.0 / 30.0f64).sqrt();
+            assert!((d.g - expect).abs() < 1e-14, "g {} vs {expect}", d.g);
+            assert!(d.r >= 6.0 && d.r <= 20.0);
+            assert!(
+                d.position[0].abs() < 1e-9,
+                "the hit lies in the plane x = 0: {:?}",
+                d.position
+            );
+            assert_eq!(p.result.exit, ExitReason::Disk);
+            assert_ne!(p.shaded.colour, [0, 0, 0]);
+        }
+        assert!(res
+            .photons
+            .iter()
+            .all(|p| p.shaded.collision != Collision::NumericalError));
+        // The same scene through the SIMD backend is identical.
+        let fast = render_curved(&cfg, None, &CpuFast, || {}).unwrap();
+        assert_eq!(res.image, fast.image);
+        for (a, b) in res.photons.iter().zip(&fast.photons) {
+            assert_eq!(a.shaded.collision, b.shaded.collision);
+            assert_eq!(
+                a.shaded.disk.map(|d| (d.r, d.phi, d.g)),
+                b.shaded.disk.map(|d| (d.r, d.phi, d.g))
+            );
+            assert_eq!(a.result.plane_crossings, b.result.plane_crossings);
+        }
+    }
+
+    #[test]
+    fn sampled_trajectories_end_on_the_disk() {
+        let mut cfg = config(9, vec![]);
+        cfg.disk = Some(Disk::new([1.0, 0.0, 0.0], 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap());
+        let probe = render_curved(&cfg, None, &CpuExact, || {}).unwrap();
+        let flat = probe
+            .photons
+            .iter()
+            .position(|p| p.shaded.collision == Collision::Disk)
+            .expect("a disk pixel");
+        cfg.sample_pixels = vec![flat];
+        let res = render_curved(&cfg, None, &CpuExact, || {}).unwrap();
+        let (_, pts) = &res.trajectories[0];
+        let last = pts.last().unwrap();
+        let r_last = crate::coords::norm(*last);
+        let hit = res.photons[flat].shaded.disk.unwrap();
+        assert!(
+            (r_last - hit.r).abs() < 0.02,
+            "trajectory ends at r = {r_last}, hit at {}",
+            hit.r
+        );
+        assert!(last[0].abs() < 0.02, "and on the plane x = 0: {last:?}");
     }
 
     #[test]

@@ -1,8 +1,11 @@
 //! From an integrated ray to a pixel: undo the equatorial rotation, classify
-//! the exit, and look the escape direction up in the sky patch.
+//! the exit, look the escape direction up in the sky patch, or shade a disk hit.
 
-use crate::coords::{cartesian_to_spherical, mat_vec, rot_x, spherical_to_cartesian};
+use crate::coords::{cartesian_to_spherical, mat_vec, rot_x, spherical_to_cartesian, Vec3};
+use crate::disk::{disk_pixel, hit_position_lab, redshift, Disk};
+use crate::initial_conditions::RayInit;
 use crate::integrator::{ExitReason, IntegrationResult};
+use crate::schwarzschild::BlackHole;
 use crate::sky_patch::SkyPatch;
 use crate::texture::{Rgb, Texture};
 
@@ -22,6 +25,7 @@ pub enum Collision {
     EscapedNoPatch,
     InDomain,
     NumericalError,
+    Disk,
 }
 
 impl Collision {
@@ -33,8 +37,25 @@ impl Collision {
             Collision::EscapedNoPatch => "escape_no_patch",
             Collision::InDomain => "in_domain",
             Collision::NumericalError => "numerical error",
+            Collision::Disk => "disk",
         }
     }
+}
+
+/// What a ray that hit the disk saw there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiskPixel {
+    /// Hit radius.
+    pub r: f64,
+    /// Hit azimuth in the ray's rotated frame.
+    pub phi: f64,
+    /// Hit position in the lab frame.
+    pub position: Vec3,
+    /// Observed/emitted frequency ratio; not finite or not positive on a hit the
+    /// physics rules out (reported as a numerical error).
+    pub g: f64,
+    /// Effective temperature of the material at the hit, in kelvin.
+    pub temperature: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +65,19 @@ pub struct ShadedRay {
     /// Exit direction in the lab frame: `θ ∈ [0, π]`, `φ ∈ (−π, π]`.
     pub final_theta: f64,
     pub final_phi: f64,
+    /// Set when the ray ended on the disk.
+    pub disk: Option<DiskPixel>,
+}
+
+/// Everything shading needs besides the ray itself.
+#[derive(Clone, Copy)]
+pub struct Scene<'a> {
+    pub black_hole: BlackHole,
+    pub r_obs: f64,
+    pub boundary_radius: f64,
+    pub patch: &'a SkyPatch,
+    pub texture: Option<&'a Texture>,
+    pub disk: Option<&'a Disk>,
 }
 
 /// Rotate a point `(r, θ, φ)` of the equatorial-plane orbit back into the lab frame
@@ -77,26 +111,60 @@ pub fn classify(r_final: f64, rs: f64, boundary_radius: f64, in_patch: bool) -> 
     }
 }
 
-/// Shade one ray. A diverged integration is a numerical error whatever its radius.
-pub fn shade(
-    result: &IntegrationResult,
-    beta: f64,
-    rs: f64,
-    boundary_radius: f64,
-    patch: &SkyPatch,
-    texture: Option<&Texture>,
-) -> ShadedRay {
-    let (final_theta, final_phi) = unrotate_hit(&result.q, beta);
-    let in_patch = texture.is_some() && patch.contains(final_theta, final_phi);
-    let collision = if result.exit == ExitReason::Diverged {
+/// Shade one ray. A diverged integration is a numerical error whatever its radius;
+/// a disk hit is coloured from its redshift and the local temperature.
+pub fn shade(result: &IntegrationResult, init: &RayInit, scene: &Scene) -> ShadedRay {
+    let (final_theta, final_phi) = unrotate_hit(&result.q, init.beta);
+    let rs = scene.black_hole.rs();
+    let in_patch = scene.texture.is_some() && scene.patch.contains(final_theta, final_phi);
+    if result.exit == ExitReason::Disk {
+        if let (Some(disk), Some(hit)) = (scene.disk, result.disk_hit) {
+            let frame = disk.ray_frame(init.beta);
+            let g = redshift(
+                scene.black_hole.mass,
+                hit.r,
+                init.p0[0],
+                init.p0[3],
+                frame.n_z,
+                scene.r_obs,
+            );
+            let temperature = disk.temperature(hit.r);
+            let pixel = DiskPixel {
+                r: hit.r,
+                phi: hit.phi,
+                position: hit_position_lab(hit.r, hit.phi, init.beta),
+                g,
+                temperature,
+            };
+            let (collision, colour) = if g.is_finite() && g > 0.0 {
+                (
+                    Collision::Disk,
+                    disk_pixel(g, temperature, disk.peak_temperature),
+                )
+            } else {
+                (Collision::NumericalError, NUMERICAL_ERROR_COLOUR)
+            };
+            return ShadedRay {
+                colour,
+                collision,
+                final_theta,
+                final_phi,
+                disk: Some(pixel),
+            };
+        }
+    }
+    let collision = if result.exit == ExitReason::Diverged || result.exit == ExitReason::Disk {
+        // A disk exit without the disk geometry cannot be shaded.
         Collision::NumericalError
     } else {
-        classify(result.q[1], rs, boundary_radius, in_patch)
+        classify(result.q[1], rs, scene.boundary_radius, in_patch)
     };
     let colour = match collision {
         Collision::EscapedBackground => {
-            let tex = texture.expect("in_patch implies a texture");
-            let (u, v) = patch.texel(final_theta, final_phi, tex.height, tex.width);
+            let tex = scene.texture.expect("in_patch implies a texture");
+            let (u, v) = scene
+                .patch
+                .texel(final_theta, final_phi, tex.height, tex.width);
             tex.texel(u, v)
         }
         Collision::NumericalError => NUMERICAL_ERROR_COLOUR,
@@ -107,6 +175,7 @@ pub fn shade(
         collision,
         final_theta,
         final_phi,
+        disk: None,
     }
 }
 
@@ -115,13 +184,51 @@ mod tests {
     use super::*;
     use std::f64::consts::PI;
 
+    use crate::integrator::DiskHit;
+
     fn result(r: f64, phi: f64, exit: ExitReason) -> IntegrationResult {
         IntegrationResult {
             q: [-40.0, r, PI / 2.0, phi],
             p: [1.0, -1.0, 0.0, 0.0],
             exit,
             n_steps: 100,
+            disk_hit: None,
+            plane_crossings: 0,
         }
+    }
+
+    fn init(beta: f64, p_t: f64, p_phi: f64) -> RayInit {
+        RayInit {
+            q0: [0.0, 30.0, PI / 2.0, 0.0],
+            p0: [p_t, -1.0, 0.0, p_phi],
+            alpha0: 0.1,
+            beta,
+            direction: [-1.0, 0.0, 0.0],
+        }
+    }
+
+    fn scene<'a>(
+        patch: &'a SkyPatch,
+        texture: Option<&'a Texture>,
+        disk: Option<&'a Disk>,
+    ) -> Scene<'a> {
+        Scene {
+            black_hole: BlackHole::new(1.0),
+            r_obs: 30.0,
+            boundary_radius: 31.0,
+            patch,
+            texture,
+            disk,
+        }
+    }
+
+    fn shade_plain(
+        result: &IntegrationResult,
+        beta: f64,
+        patch: &SkyPatch,
+        texture: Option<&Texture>,
+    ) -> ShadedRay {
+        shade(result, &init(beta, 1.0, 0.0), &scene(patch, texture, None))
     }
 
     fn gradient_texture(h: usize, w: usize) -> Texture {
@@ -172,11 +279,9 @@ mod tests {
     fn shade_colours_each_outcome() {
         let patch = SkyPatch::full_sky();
         let tex = gradient_texture(16, 32);
-        let escaped = shade(
+        let escaped = shade_plain(
             &result(31.0, 2.0, ExitReason::Escaped),
             0.0,
-            2.0,
-            31.0,
             &patch,
             Some(&tex),
         );
@@ -185,54 +290,39 @@ mod tests {
         assert_eq!(escaped.colour, tex.texel(u, v));
         assert_eq!(escaped.colour, [u as u8, v as u8, 7]);
 
-        let no_texture = shade(
-            &result(31.0, 2.0, ExitReason::Escaped),
-            0.0,
-            2.0,
-            31.0,
-            &patch,
-            None,
-        );
+        let no_texture = shade_plain(&result(31.0, 2.0, ExitReason::Escaped), 0.0, &patch, None);
         assert_eq!(no_texture.collision, Collision::EscapedNoPatch);
         assert_eq!(no_texture.colour, BLACK);
 
         let narrow = SkyPatch::from_degrees(90.0, 180.0, 10.0, 10.0, 0.0, 0.0, false, false);
-        let outside = shade(
+        let outside = shade_plain(
             &result(31.0, 0.5, ExitReason::Escaped),
             0.0,
-            2.0,
-            31.0,
             &narrow,
             Some(&tex),
         );
         assert_eq!(outside.collision, Collision::EscapedNoPatch);
 
-        let far = shade(
+        let far = shade_plain(
             &result(150.0, 1.0, ExitReason::Escaped),
             0.0,
-            2.0,
-            31.0,
             &patch,
             Some(&tex),
         );
         assert_eq!(far.collision, Collision::NumericalError);
         assert_eq!(far.colour, NUMERICAL_ERROR_COLOUR);
 
-        let diverged = shade(
+        let diverged = shade_plain(
             &result(10.0, 1.0, ExitReason::Diverged),
             0.0,
-            2.0,
-            31.0,
             &patch,
             Some(&tex),
         );
         assert_eq!(diverged.collision, Collision::NumericalError);
 
-        let captured = shade(
+        let captured = shade_plain(
             &result(2.19, 1.0, ExitReason::Captured),
             0.0,
-            2.0,
-            31.0,
             &patch,
             Some(&tex),
         );
@@ -250,11 +340,53 @@ mod tests {
             ..plain
         };
         let res = result(31.0, 2.5, ExitReason::Escaped);
-        let a = shade(&res, 0.4, 2.0, 31.0, &plain, Some(&tex));
-        let b = shade(&res, 0.4, 2.0, 31.0, &flipped, Some(&tex));
+        let a = shade_plain(&res, 0.4, &plain, Some(&tex));
+        let b = shade_plain(&res, 0.4, &flipped, Some(&tex));
         assert_eq!(a.collision, b.collision);
         let (u, v) = plain.texel(PI - a.final_theta, -a.final_phi, 16, 32);
         assert_eq!(b.colour, tex.texel(u, v));
         assert_ne!(a.colour, b.colour);
+    }
+
+    #[test]
+    fn disk_hits_are_shaded_from_their_redshift() {
+        let patch = SkyPatch::full_sky();
+        let disk = Disk::new([0.0, 0.0, 1.0], 6.0, 20.0, 6000.0, 1.0, 30.0).unwrap();
+        let mut res = result(9.0, 0.1, ExitReason::Disk);
+        res.disk_hit = Some(DiskHit { r: 9.0, phi: PI });
+        res.plane_crossings = 1;
+        // A left-hand pixel (β = π): the frame has n'_z = −1 and p_φ > 0, so g > 1.
+        let left = shade(&res, &init(PI, 1.0, 5.0), &scene(&patch, None, Some(&disk)));
+        assert_eq!(left.collision, Collision::Disk);
+        let px = left.disk.unwrap();
+        assert!(px.g > 1.0 && px.g.is_finite());
+        assert!((px.temperature - disk.temperature(9.0)).abs() < 1e-9);
+        assert!(
+            (px.position[0] + 9.0).abs() < 1e-12 && px.position[2].abs() < 1e-9,
+            "{:?}",
+            px.position
+        );
+        assert_ne!(left.colour, BLACK);
+        let right = shade(
+            &res,
+            &init(0.0, 1.0, 5.0),
+            &scene(&patch, None, Some(&disk)),
+        );
+        assert!(right.disk.unwrap().g < 1.0);
+        // Expected closed form with b_z = −p_φ n'_z / p_t = 5.
+        let g = (1.0 - 3.0 / 9.0f64).sqrt()
+            / ((1.0 - (1.0 / 729.0f64).sqrt() * 5.0) * (1.0 - 2.0 / 30.0f64).sqrt());
+        assert!((px.g - g).abs() < 1e-12);
+        // A hit the physics rules out (1 − Ω b_z ≤ 0) is a numerical error, not a pixel.
+        let bad = shade(
+            &res,
+            &init(PI, 1.0, 50.0),
+            &scene(&patch, None, Some(&disk)),
+        );
+        assert_eq!(bad.collision, Collision::NumericalError);
+        assert_eq!(bad.colour, NUMERICAL_ERROR_COLOUR);
+        // A disk exit without disk geometry cannot be shaded either.
+        let orphan = shade(&res, &init(PI, 1.0, 5.0), &scene(&patch, None, None));
+        assert_eq!(orphan.collision, Collision::NumericalError);
     }
 }

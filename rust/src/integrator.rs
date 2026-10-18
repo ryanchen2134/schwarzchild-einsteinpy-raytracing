@@ -20,11 +20,36 @@
 //! The only place the Python differed from the general formula is the
 //! `r`-derivative of `g^{tt}` and `g^{rr}`, where it hard-coded `r_s = 2`;
 //! in units of `M` the two are the same.
+//!
+//! # Disk crossings
+//!
+//! A ray may carry the azimuth `phi_d` at which the accretion disk's plane cuts its
+//! orbital plane ([`crate::disk::Disk::ray_frame`]). The plane is crossed where
+//! `n' · x = r |n'_⊥| sin(φ − phi_d)` changes sign, i.e. where
+//! `floor((φ − phi_d)/π)` changes by exactly one between consecutive steps; `φ` is
+//! never reduced modulo `2π` inside the integrator, so the floor is monotone along
+//! the ray. The crossing radius is interpolated linearly in `φ` between the two
+//! states. Crossings are only looked for from the second step on: every ray starts
+//! at the observer, which sits on the crossing line of an edge-on disk, and a
+//! crossing within one step of the start would lie outside the disk anyway
+//! (`r_out < r_obs` is enforced). Each step's crossing check runs before the next
+//! step's capture/escape check, so a crossing on a ray's last step is not lost. A
+//! crossing inside `[r_in, r_out]` ends the ray with [`ExitReason::Disk`]; every
+//! crossing is counted. The arithmetic is written out so that the SIMD and CUDA
+//! kernels can reproduce it bit for bit.
 
 use rayon::prelude::*;
+use std::f64::consts::PI;
 
 /// A ray is counted as captured once `r ≤ HORIZON_EXIT_FACTOR · r_s`.
 pub const HORIZON_EXIT_FACTOR: f64 = 1.1;
+
+/// Radial extent of the disk, in the caller's length unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiskBand {
+    pub r_in: f64,
+    pub r_out: f64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IntegratorSettings {
@@ -38,6 +63,9 @@ pub struct IntegratorSettings {
     pub r_max: f64,
     /// Rays stop once `r ≤ r_capture` (captured).
     pub r_capture: f64,
+    /// Rays that carry a finite `disk_phi` stop on crossing the disk plane inside
+    /// this band. `None` disables crossing detection for every ray.
+    pub disk: Option<DiskBand>,
 }
 
 impl IntegratorSettings {
@@ -48,7 +76,48 @@ impl IntegratorSettings {
             omega,
             r_max,
             r_capture: HORIZON_EXIT_FACTOR * rs,
+            disk: None,
         }
+    }
+
+    pub fn with_disk(mut self, band: DiskBand) -> Self {
+        self.disk = Some(band);
+        self
+    }
+}
+
+/// One ray's initial state plus the per-ray disk geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ray {
+    pub q0: [f64; 4],
+    pub p0: [f64; 4],
+    /// Azimuth of the disk-plane crossing line in this ray's frame; `NaN` when no
+    /// crossing is to be detected (no disk, or the ray lies in the disk plane).
+    pub disk_phi: f64,
+}
+
+impl Ray {
+    pub fn new(q0: [f64; 4], p0: [f64; 4]) -> Self {
+        Self {
+            q0,
+            p0,
+            disk_phi: f64::NAN,
+        }
+    }
+
+    pub fn with_disk(q0: [f64; 4], p0: [f64; 4], disk_phi: f64) -> Self {
+        Self { q0, p0, disk_phi }
+    }
+
+    #[inline]
+    pub fn detects_disk(&self) -> bool {
+        self.disk_phi.is_finite()
+    }
+}
+
+impl From<([f64; 4], [f64; 4])> for Ray {
+    fn from((q0, p0): ([f64; 4], [f64; 4])) -> Self {
+        Ray::new(q0, p0)
     }
 }
 
@@ -64,6 +133,8 @@ pub enum ExitReason {
     /// non-positive, or the second copy inside the horizon where the metric is
     /// singular. The result must not be trusted.
     Diverged,
+    /// Crossed the accretion disk's plane inside its radial band.
+    Disk,
 }
 
 impl ExitReason {
@@ -73,19 +144,71 @@ impl ExitReason {
             ExitReason::Escaped => "escaped",
             ExitReason::StepLimit => "step_limit",
             ExitReason::Diverged => "diverged",
+            ExitReason::Disk => "disk",
         }
     }
 }
 
+/// Where a ray met the disk, in the ray's rotated frame and the caller's length unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiskHit {
+    pub r: f64,
+    /// `phi_d + kπ` for the crossing's `k`; not reduced modulo `2π`.
+    pub phi: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IntegrationResult {
-    /// Final `(t, r, θ, φ)` of the first phase-space copy.
+    /// Final `(t, r, θ, φ)` of the first phase-space copy (for a disk hit, the state
+    /// just after the crossing step).
     pub q: [f64; 4],
     /// Final covariant momentum of the first copy.
     pub p: [f64; 4],
     pub exit: ExitReason,
     /// Steps actually taken.
     pub n_steps: usize,
+    /// Set when `exit == Disk`.
+    pub disk_hit: Option<DiskHit>,
+    /// How many times the ray crossed the disk plane, the terminating hit included.
+    pub plane_crossings: u32,
+}
+
+/// Crossing detection between two consecutive states, in units of `M`.
+#[derive(Clone, Copy, Debug)]
+pub struct CrossingDetector {
+    pub phi_d: f64,
+    pub r_in: f64,
+    pub r_out: f64,
+}
+
+/// A detected crossing: interpolated `(r, φ)` and whether it lies in the band.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crossing {
+    pub r: f64,
+    pub phi: f64,
+    pub in_band: bool,
+}
+
+impl CrossingDetector {
+    /// Did the plane get crossed between `(r_prev, phi_prev)` and `(r, phi)`?
+    #[inline]
+    pub fn check(&self, r_prev: f64, phi_prev: f64, r: f64, phi: f64) -> Option<Crossing> {
+        let k_prev = ((phi_prev - self.phi_d) / PI).floor();
+        let k = ((phi - self.phi_d) / PI).floor();
+        let d = k - k_prev;
+        if d != 1.0 && d != -1.0 {
+            return None;
+        }
+        let k_boundary = if d > 0.0 { k } else { k_prev };
+        let phi_c = self.phi_d + k_boundary * PI;
+        let frac = (phi_c - phi_prev) / (phi - phi_prev);
+        let r_hit = r_prev + (r - r_prev) * frac;
+        Some(Crossing {
+            r: r_hit,
+            phi: phi_c,
+            in_band: r_hit >= self.r_in && r_hit <= self.r_out,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +352,10 @@ struct Run {
     sin_m: f64,
     r_max: f64,
     r_capture: f64,
+    disk: Option<CrossingDetector>,
+    n_steps: usize,
+    crossings: u32,
+    hit: Option<DiskHit>,
 }
 
 /// Divide the length-carrying components by `k`.
@@ -250,12 +377,20 @@ fn scale_up(q: &mut [f64; 4], p: &mut [f64; 4], k: f64) {
 }
 
 impl Run {
-    fn new(q0: [f64; 4], p0: [f64; 4], rs: f64, settings: &IntegratorSettings) -> Self {
+    fn new(ray: &Ray, rs: f64, settings: &IntegratorSettings) -> Self {
         let mass = rs / RS_UNIT;
-        let (mut q, mut p) = (q0, p0);
+        let (mut q, mut p) = (ray.q0, ray.p0);
         scale_down(&mut q, &mut p, mass);
         let delta = settings.delta / mass;
         let (sin_m, cos_m) = (2.0 * settings.omega * delta).sin_cos();
+        let disk = match settings.disk {
+            Some(band) if ray.detects_disk() => Some(CrossingDetector {
+                phi_d: ray.disk_phi,
+                r_in: band.r_in / mass,
+                r_out: band.r_out / mass,
+            }),
+            _ => None,
+        };
         Self {
             s: State {
                 q1: q,
@@ -269,6 +404,10 @@ impl Run {
             sin_m,
             r_max: settings.r_max / mass,
             r_capture: settings.r_capture / mass,
+            disk,
+            n_steps: 0,
+            crossings: 0,
+            hit: None,
         }
     }
 
@@ -279,6 +418,27 @@ impl Run {
         flow_mixed(&mut self.s, self.cos_m, self.sin_m);
         flow_b(&mut self.s, self.half_delta, RS_UNIT);
         flow_a(&mut self.s, self.half_delta, RS_UNIT);
+    }
+
+    /// One step, then the disk-crossing check (from the second step on). Returns
+    /// `true` when the ray hit the disk.
+    #[inline]
+    fn advance(&mut self) -> bool {
+        let (r_prev, phi_prev) = (self.s.q1[1], self.s.q1[3]);
+        self.step();
+        self.n_steps += 1;
+        if let Some(det) = &self.disk {
+            if self.n_steps >= 2 {
+                if let Some(c) = det.check(r_prev, phi_prev, self.s.q1[1], self.s.q1[3]) {
+                    self.crossings += 1;
+                    if c.in_band {
+                        self.hit = Some(DiskHit { r: c.r, phi: c.phi });
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     #[inline]
@@ -305,36 +465,48 @@ impl Run {
         q
     }
 
-    fn finish(&self, exit: ExitReason, n_steps: usize) -> IntegrationResult {
+    fn finish(&self, exit: ExitReason) -> IntegrationResult {
         let (mut q, mut p) = (self.s.q1, self.s.p1);
         scale_up(&mut q, &mut p, self.mass);
         IntegrationResult {
             q,
             p,
             exit,
-            n_steps,
+            n_steps: self.n_steps,
+            disk_hit: self.hit.map(|h| DiskHit {
+                r: h.r * self.mass,
+                phi: h.phi,
+            }),
+            plane_crossings: self.crossings,
         }
     }
 }
 
-/// Integrate one ray from `(q0, p0)` until it is captured, escapes, diverges, or
-/// `settings.steps` run out.
+/// Integrate one ray (no disk) from `(q0, p0)` until it is captured, escapes,
+/// diverges, or `settings.steps` run out.
 pub fn integrate(
     q0: [f64; 4],
     p0: [f64; 4],
     rs: f64,
     settings: &IntegratorSettings,
 ) -> IntegrationResult {
-    let mut run = Run::new(q0, p0, rs, settings);
-    let mut n_steps = 0;
+    integrate_ray(&Ray::new(q0, p0), rs, settings)
+}
+
+/// Integrate one ray until it is captured, escapes, hits the disk, diverges, or
+/// `settings.steps` run out.
+pub fn integrate_ray(ray: &Ray, rs: f64, settings: &IntegratorSettings) -> IntegrationResult {
+    let mut run = Run::new(ray, rs, settings);
     let mut exit = ExitReason::StepLimit;
     for _ in 0..settings.steps {
         if let Some(reason) = run.exit_reason() {
             exit = reason;
             break;
         }
-        run.step();
-        n_steps += 1;
+        if run.advance() {
+            exit = ExitReason::Disk;
+            break;
+        }
     }
     if exit == ExitReason::StepLimit {
         // A ray that crossed a boundary on its very last step is still captured/escaped.
@@ -342,23 +514,21 @@ pub fn integrate(
             exit = reason;
         }
     }
-    run.finish(exit, n_steps)
+    run.finish(exit)
 }
 
-/// Like [`integrate`], also returning `(t, r, θ, φ)` *before* each step, exactly as
+/// Like [`integrate_ray`], also returning `(t, r, θ, φ)` *before* each step, exactly as
 /// the CUDA kernel records it: when the ray leaves the domain within the step budget
 /// the last entry is the exit state; otherwise `steps` entries are returned and the
 /// state after the final step is not among them, even if that last step crossed a
 /// boundary (the exit reason still reports it).
 pub fn integrate_trajectory(
-    q0: [f64; 4],
-    p0: [f64; 4],
+    ray: &Ray,
     rs: f64,
     settings: &IntegratorSettings,
 ) -> (Vec<[f64; 4]>, IntegrationResult) {
-    let mut run = Run::new(q0, p0, rs, settings);
+    let mut run = Run::new(ray, rs, settings);
     let mut traj = Vec::with_capacity(settings.steps.min(1 << 16) + 1);
-    let mut n_steps = 0;
     let mut exit = ExitReason::StepLimit;
     for _ in 0..settings.steps {
         traj.push(run.q_out());
@@ -366,36 +536,37 @@ pub fn integrate_trajectory(
             exit = reason;
             break;
         }
-        run.step();
-        n_steps += 1;
+        if run.advance() {
+            exit = ExitReason::Disk;
+            traj.push(run.q_out());
+            break;
+        }
     }
     if exit == ExitReason::StepLimit {
         if let Some(reason) = run.exit_reason() {
             exit = reason;
         }
     }
-    (traj, run.finish(exit, n_steps))
+    (traj, run.finish(exit))
 }
 
 /// Like [`integrate_trajectory`], but keeps at most `2 · max_points + 1` states: a
 /// stride-doubling reservoir that always holds the start and, when the ray leaves
 /// the domain, the exit state. Memory no longer scales with the step budget.
 pub fn integrate_trajectory_bounded(
-    q0: [f64; 4],
-    p0: [f64; 4],
+    ray: &Ray,
     rs: f64,
     settings: &IntegratorSettings,
     max_points: usize,
 ) -> (Vec<[f64; 4]>, IntegrationResult) {
     let cap = 2 * max_points.max(1);
-    let mut run = Run::new(q0, p0, rs, settings);
+    let mut run = Run::new(ray, rs, settings);
     let mut traj = Vec::with_capacity(cap);
     let mut stride = 1usize;
-    let mut n_steps = 0;
     let mut exit = ExitReason::StepLimit;
     for _ in 0..settings.steps {
         let exiting = run.exit_reason();
-        if n_steps % stride == 0 || exiting.is_some() {
+        if run.n_steps.is_multiple_of(stride) || exiting.is_some() {
             traj.push(run.q_out());
             if traj.len() == cap {
                 traj = traj.iter().step_by(2).copied().collect();
@@ -406,21 +577,23 @@ pub fn integrate_trajectory_bounded(
             exit = reason;
             break;
         }
-        run.step();
-        n_steps += 1;
+        if run.advance() {
+            exit = ExitReason::Disk;
+            break;
+        }
     }
     if exit == ExitReason::StepLimit {
         if let Some(reason) = run.exit_reason() {
             exit = reason;
         }
     }
-    // A boundary crossed on the last permitted step is detected after the loop; the
-    // exit state is still recorded.
+    // A boundary crossed on the last permitted step is detected after the loop, and a
+    // disk hit ends the loop after the step; the exit state is still recorded.
     let last = run.q_out();
     if exit != ExitReason::StepLimit && traj.last() != Some(&last) {
         traj.push(last);
     }
-    (traj, run.finish(exit, n_steps))
+    (traj, run.finish(exit))
 }
 
 /// Integrate many rays in parallel. `on_ray_done` is called once per finished ray.
@@ -431,11 +604,11 @@ pub fn integrate_batch<I, F>(
     on_ray_done: F,
 ) -> Vec<IntegrationResult>
 where
-    I: IndexedParallelIterator<Item = ([f64; 4], [f64; 4])>,
+    I: IndexedParallelIterator<Item = Ray>,
     F: Fn() + Sync,
 {
-    rays.map(|(q0, p0)| {
-        let r = integrate(q0, p0, rs, settings);
+    rays.map(|ray| {
+        let r = integrate_ray(&ray, rs, settings);
         on_ray_done();
         r
     })
@@ -486,7 +659,7 @@ mod tests {
     #[test]
     fn trajectory_last_entry_is_exit_state() {
         let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 4.0, 0.0], 1.0);
-        let (traj, res) = integrate_trajectory(init.q0, init.p0, 2.0, &settings());
+        let (traj, res) = integrate_trajectory(&Ray::new(init.q0, init.p0), 2.0, &settings());
         assert_eq!(traj.len(), res.n_steps + 1);
         assert_eq!(traj.last().unwrap(), &res.q);
         assert_eq!(traj[0], init.q0);
@@ -517,12 +690,12 @@ mod tests {
         assert_eq!(res.n_steps, full.n_steps);
         assert_eq!(res.q, full.q);
         // The kernel-faithful trajectory holds `steps` states and omits the exit state.
-        let (traj, res2) = integrate_trajectory(init.q0, init.p0, 2.0, &s);
+        let (traj, res2) = integrate_trajectory(&Ray::new(init.q0, init.p0), 2.0, &s);
         assert_eq!(res2.exit, ExitReason::Escaped);
         assert_eq!(traj.len(), s.steps);
         assert!(traj.last().unwrap()[1] < 31.0);
         // The bounded recorder always includes the exit state.
-        let (btraj, res3) = integrate_trajectory_bounded(init.q0, init.p0, 2.0, &s, 50);
+        let (btraj, res3) = integrate_trajectory_bounded(&Ray::new(init.q0, init.p0), 2.0, &s, 50);
         assert_eq!(res3.exit, ExitReason::Escaped);
         assert_eq!(btraj.last().unwrap(), &res3.q);
     }
@@ -530,8 +703,9 @@ mod tests {
     #[test]
     fn bounded_trajectory_is_a_thinned_copy_of_the_full_one() {
         let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 4.0, 0.0], 1.0);
-        let (full, _) = integrate_trajectory(init.q0, init.p0, 2.0, &settings());
-        let (bounded, res) = integrate_trajectory_bounded(init.q0, init.p0, 2.0, &settings(), 100);
+        let (full, _) = integrate_trajectory(&Ray::new(init.q0, init.p0), 2.0, &settings());
+        let (bounded, res) =
+            integrate_trajectory_bounded(&Ray::new(init.q0, init.p0), 2.0, &settings(), 100);
         assert!(
             bounded.len() <= 200 && bounded.len() > 50,
             "{}",
@@ -569,5 +743,248 @@ mod tests {
         assert_eq!(res2.q[1], 2.0 * res1.q[1]);
         assert_eq!(res2.q[2], res1.q[2]);
         assert_eq!(res2.q[3], res1.q[3]);
+    }
+
+    /// A straight line in a flat plane, fed to the detector step by step: the hit
+    /// radius converges to the exact line–line intersection as the square of the step.
+    #[test]
+    fn crossing_detector_on_a_straight_line_converges_as_the_step_squared() {
+        // Line x(λ) = x0 + λ d in the plane, crossing line at azimuth phi_d.
+        let x0 = [30.0f64, -4.0];
+        let d = [-0.96f64, 0.28];
+        let phi_d = 2.0f64;
+        let det = CrossingDetector {
+            phi_d,
+            r_in: 0.0,
+            r_out: 1e9,
+        };
+        // Exact crossing: x(λ) ∥ (cos phi_d, sin phi_d) ⇒ x(λ) sin phi_d − y(λ) cos phi_d = 0.
+        let (sd, cd) = phi_d.sin_cos();
+        let lambda = -(x0[0] * sd - x0[1] * cd) / (d[0] * sd - d[1] * cd);
+        let exact_r = ((x0[0] + lambda * d[0]).powi(2) + (x0[1] + lambda * d[1]).powi(2)).sqrt();
+        let run = |h: f64| -> (f64, u32) {
+            let mut lam = 0.0;
+            let state = |l: f64| {
+                let x = x0[0] + l * d[0];
+                let y = x0[1] + l * d[1];
+                (x.hypot(y), y.atan2(x))
+            };
+            let (mut r_prev, mut phi_prev) = state(0.0);
+            // Unwrap φ by hand as the integrator's monotone φ would be.
+            let mut hit = None;
+            let mut count = 0;
+            while lam < 80.0 {
+                lam += h;
+                let (r, mut phi) = state(lam);
+                while phi - phi_prev > PI {
+                    phi -= 2.0 * PI;
+                }
+                while phi - phi_prev < -PI {
+                    phi += 2.0 * PI;
+                }
+                if let Some(c) = det.check(r_prev, phi_prev, r, phi) {
+                    count += 1;
+                    if hit.is_none() {
+                        hit = Some(c.r);
+                    }
+                }
+                r_prev = r;
+                phi_prev = phi;
+            }
+            (hit.expect("the line crosses"), count)
+        };
+        let (r1, n1) = run(0.2);
+        let (r2, n2) = run(0.1);
+        let (r3, n3) = run(0.05);
+        assert_eq!(
+            (n1, n2, n3),
+            (1, 1, 1),
+            "a straight line crosses a line through the origin once"
+        );
+        let (e1, e2, e3) = (
+            (r1 - exact_r).abs(),
+            (r2 - exact_r).abs(),
+            (r3 - exact_r).abs(),
+        );
+        assert!(e3 < 1e-3 && e2 > e3 && e1 > e2, "{e1} {e2} {e3}");
+        assert!(
+            (e1 / e2) > 3.0 && (e2 / e3) > 3.0,
+            "second order: {e1} {e2} {e3}"
+        );
+    }
+
+    #[test]
+    fn circular_motion_crosses_the_plane_twice_per_revolution_at_the_orbit_radius() {
+        let det = CrossingDetector {
+            phi_d: 0.7,
+            r_in: 5.0,
+            r_out: 20.0,
+        };
+        let r = 9.0;
+        let mut phi_prev = 0.0;
+        let mut hits = Vec::new();
+        let mut phi = 0.0;
+        while phi < 4.0 * PI {
+            phi += 0.013;
+            if let Some(c) = det.check(r, phi_prev, r, phi) {
+                assert_eq!(c.r, r);
+                assert!(c.in_band);
+                hits.push(c.phi);
+            }
+            phi_prev = phi;
+        }
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        for (k, h) in hits.iter().enumerate() {
+            assert!(
+                (h - (0.7 + k as f64 * PI)).abs() < 1e-12,
+                "crossing {k} at {h}"
+            );
+        }
+        // Going the other way (φ decreasing) finds the same crossings.
+        let mut back = Vec::new();
+        let (mut phi, mut phi_prev) = (4.0 * PI, 4.0 * PI);
+        while phi > 0.0 {
+            phi -= 0.013;
+            if let Some(c) = det.check(r, phi_prev, r, phi) {
+                back.push(c.phi);
+            }
+            phi_prev = phi;
+        }
+        assert_eq!(back.len(), 4);
+        // A jump of two boundaries in one step is not a crossing.
+        assert!(det.check(r, 0.0, r, 0.7 + 2.5 * PI).is_none());
+        assert!(det.check(r, 1.0, r, 1.2).is_none());
+    }
+
+    fn disk_settings() -> IntegratorSettings {
+        settings().with_disk(DiskBand {
+            r_in: 6.0,
+            r_out: 20.0,
+        })
+    }
+
+    #[test]
+    fn a_ray_aimed_through_the_disk_stops_there() {
+        // Face-on disk (plane x = 0, crossing line at φ = ±π/2 in every ray's frame):
+        // a ray with impact parameter ≈ 10 crosses it inside the band.
+        let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 2.0, 0.0], 1.0);
+        let ray = Ray::with_disk(init.q0, init.p0, PI / 2.0);
+        let res = integrate_ray(&ray, 2.0, &disk_settings());
+        assert_eq!(res.exit, ExitReason::Disk);
+        let hit = res.disk_hit.unwrap();
+        assert!(hit.r > 6.0 && hit.r < 20.0, "{hit:?}");
+        assert!((hit.phi - PI / 2.0).abs() < 1e-12);
+        assert_eq!(res.plane_crossings, 1);
+        assert!(
+            res.q[3] >= hit.phi && res.q[3] - hit.phi < 0.01,
+            "stopped just past the crossing"
+        );
+        // Without the per-ray azimuth, or without the band, the same ray escapes.
+        let plain = integrate_ray(&Ray::new(init.q0, init.p0), 2.0, &disk_settings());
+        assert_eq!(plain.exit, ExitReason::Escaped);
+        assert_eq!(plain.plane_crossings, 0);
+        let no_band = integrate_ray(&ray, 2.0, &settings());
+        assert_eq!(no_band.exit, ExitReason::Escaped);
+        // A radial ray never crosses the plane through the hole: captured, no crossings.
+        let radial = initial_conditions([30.0, 0.0, 0.0], [24.0, 0.0, 0.0], 1.0);
+        let res = integrate_ray(
+            &Ray::with_disk(radial.q0, radial.p0, PI / 2.0),
+            2.0,
+            &disk_settings(),
+        );
+        assert_eq!(res.exit, ExitReason::Captured);
+        assert_eq!(res.plane_crossings, 0);
+        assert!(res.disk_hit.is_none());
+    }
+
+    #[test]
+    fn crossings_outside_the_band_are_counted_but_do_not_stop_the_ray() {
+        // Impact parameter ≈ 24 > r_out: the crossing is counted, the ray escapes.
+        let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 6.0, 0.0], 1.0);
+        let res = integrate_ray(
+            &Ray::with_disk(init.q0, init.p0, PI / 2.0),
+            2.0,
+            &disk_settings(),
+        );
+        assert_eq!(res.exit, ExitReason::Escaped);
+        assert_eq!(res.plane_crossings, 1);
+        assert!(res.disk_hit.is_none());
+    }
+
+    #[test]
+    fn disk_off_results_are_unchanged_by_the_crossing_code() {
+        for pix in [[24.0, 0.5, 0.0], [24.0, 1.1, 0.3], [24.0, 4.0, 0.0]] {
+            let init = initial_conditions([30.0, 0.0, 0.0], pix, 1.0);
+            let a = integrate(init.q0, init.p0, 2.0, &settings());
+            let b = integrate_ray(&Ray::new(init.q0, init.p0), 2.0, &disk_settings());
+            assert_eq!(a.q, b.q);
+            assert_eq!(a.p, b.p);
+            assert_eq!(a.exit, b.exit);
+            assert_eq!(a.n_steps, b.n_steps);
+            assert_eq!(b.plane_crossings, 0);
+        }
+    }
+
+    #[test]
+    fn edge_on_rays_do_not_register_a_crossing_at_the_observer() {
+        // Edge-on disk n = ẑ: the crossing line is the x axis (phi_d = 0 or π) and every
+        // ray starts on it. Wide rays leave the plane and never return.
+        let s = settings().with_disk(DiskBand {
+            r_in: 6.0,
+            r_out: 29.5,
+        });
+        for pix in [[24.0, 6.0, 6.0], [24.0, -5.0, 6.0], [24.0, 0.0, -6.0]] {
+            let init = initial_conditions([30.0, 0.0, 0.0], pix, 1.0);
+            let phi_d = if init.beta.sin() > 0.0 { 0.0 } else { PI };
+            let res = integrate_ray(&Ray::with_disk(init.q0, init.p0, phi_d), 2.0, &s);
+            assert_eq!(res.exit, ExitReason::Escaped, "{pix:?}");
+            assert_eq!(res.plane_crossings, 0, "{pix:?}");
+        }
+    }
+
+    #[test]
+    fn a_crossing_on_the_last_permitted_step_is_a_disk_exit() {
+        let init = initial_conditions([30.0, 0.0, 0.0], [24.0, 2.0, 0.0], 1.0);
+        let ray = Ray::with_disk(init.q0, init.p0, PI / 2.0);
+        let full = integrate_ray(&ray, 2.0, &disk_settings());
+        assert_eq!(full.exit, ExitReason::Disk);
+        let s = IntegratorSettings {
+            steps: full.n_steps,
+            ..disk_settings()
+        };
+        let res = integrate_ray(&ray, 2.0, &s);
+        assert_eq!(res.exit, ExitReason::Disk);
+        assert_eq!(res.disk_hit, full.disk_hit);
+        let short = IntegratorSettings {
+            steps: full.n_steps - 1,
+            ..disk_settings()
+        };
+        assert_eq!(integrate_ray(&ray, 2.0, &short).exit, ExitReason::StepLimit);
+        // The recorders stop at the hit too and end with the post-crossing state.
+        let (traj, r2) = integrate_trajectory(&ray, 2.0, &disk_settings());
+        assert_eq!(r2.exit, ExitReason::Disk);
+        assert_eq!(traj.len(), full.n_steps + 1);
+        assert_eq!(traj.last().unwrap(), &full.q);
+        let (btraj, r3) = integrate_trajectory_bounded(&ray, 2.0, &disk_settings(), 40);
+        assert_eq!(r3.exit, ExitReason::Disk);
+        assert_eq!(btraj.last().unwrap(), &full.q);
+        assert!(btraj.len() <= 81);
+    }
+
+    #[test]
+    fn phi_is_never_wrapped() {
+        // A near-critical ray loops the hole: its final φ exceeds 2π.
+        let alpha = 1.002 * crate::schwarzschild::BlackHole::new(1.0).capture_angle(30.0);
+        let (p_r, p_th, p_ph) = crate::initial_conditions::equatorial_momentum(alpha, 30.0, 1.0);
+        let p_t =
+            crate::initial_conditions::null_p_t(1.0 - 2.0 / 30.0, 30.0, PI / 2.0, p_r, p_th, p_ph);
+        let res = integrate(
+            [0.0, 30.0, PI / 2.0, 0.0],
+            [p_t, p_r, p_th, p_ph],
+            2.0,
+            &IntegratorSettings::new(200_000, 0.01, 0.01, 31.0, 2.0),
+        );
+        assert_eq!(res.exit, ExitReason::Escaped);
+        assert!(res.q[3] > 2.0 * PI, "φ = {}", res.q[3]);
     }
 }
