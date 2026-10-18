@@ -96,7 +96,7 @@ integ = CUDASchwarzschildIntegrator(steps=args.steps,
                                     delta=args.delta,
                                     mass=BH_MASS,
                                     r_max=BOUNDARY_RADIUS)
-traj = integ.integrate_batch_full(q0s, p0s)      # shape (50, steps, 4)
+traj = integ.integrate_batch_full(q0s, p0s)      # shape (50, steps + 1, 4)
 
 # ------------------------------------------------------------
 # 5.  3-D plot with ≤ 500 points per trajectory

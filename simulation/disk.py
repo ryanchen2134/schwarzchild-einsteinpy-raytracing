@@ -12,10 +12,11 @@ angles. The *inclination* ``i`` in [0, 180] degrees is the angle between ``n`` a
 the observer's position vector ``+x``: 0 is face-on, 90 edge-on, 180 face-on from
 the other side, which reverses the sense of rotation on the sky. The *azimuth*
 ``a`` turns ``n`` right-handedly about ``+x``: ``n = R_x(a) . (cos i, 0, sin i)``.
-At ``a = 0`` the normal lies in the x-z plane, so an inclined disk's near side is
-below the black hole in the image and its far side above. Both angles are measured
-against the observer's position, not the optical axis, so turning the camera does
-not move the disk.
+At ``a = 0`` the normal lies in the x-z plane, so a disk inclined by less than 90
+degrees has its near side below the black hole in the image and its far side above;
+between 90 and 180 degrees (the same plane as ``(180 - i, a + 180)``, turning the
+other way) the near side is above. Both angles are measured against the observer's
+position, not the optical axis, so turning the camera does not move the disk.
 
 The material orbits right-handedly about ``n``: at ``x`` it moves along ``n x x_hat``.
 With ``i = 90, a = 0`` (``n = +z``) the material at ``(0, -r, 0)``, on the observer's
@@ -45,11 +46,16 @@ Emission
 The effective temperature follows the Newtonian Shakura-Sunyaev profile with zero
 torque at the inner edge, ``T^4 ~ (1 - sqrt(r_in/r)) / r^3``, which peaks at
 ``r = 49/36 r_in``; the peak value is the user's ``--disk-temperature``. Liouville's
-theorem makes the observed spectrum a blackbody at ``g T``: its bolometric intensity
-is ``(gT)^4`` and its colour the chromaticity of a blackbody at ``gT``. The pixel is
-that chromaticity scaled by the tone-mapped intensity ``(gT/T_peak)^4``. The
-temperature is a false-colour parameter: at realistic disk temperatures every pixel
-would be white.
+theorem (``I_nu/nu^3`` is invariant) makes the observed spectrum a blackbody at
+``g T``: its bolometric intensity is ``(gT)^4`` and its colour the chromaticity of a
+blackbody at ``gT``; nothing is multiplied by ``g^4`` on top of that. The pixel's
+linear luminance is the tone-mapped intensity ``1 - exp(-(gT/T_peak)^4)`` (0.63 at
+the peak temperature without Doppler shift, leaving headroom for the approaching
+side), so brightness rises monotonically with ``g``, and its hue is the blackbody
+chromaticity at ``gT``; a colour too saturated to show at that luminance is
+desaturated towards white at constant luminance (``disk_rgb_linear``). The
+temperature is a false-colour parameter: at realistic disk temperatures (1e5-1e7 K)
+every pixel would be white.
 """
 import math
 
@@ -174,11 +180,20 @@ def redshift(mass, r, p_t, p_phi, n_z, r_obs):
     b_z = -p_phi n'_z / p_t (module doc). p_t and p_phi are the traced ray's conserved
     initial momenta in its rotated frame. A result that is not finite and positive
     means 1 - Omega b_z <= 0, which no photon reaching the observer can produce:
-    treat it as an error."""
+    treat it as an error. 1 - Omega b_z == 0 gives an infinite g (sign of the
+    numerator), as IEEE division does, rather than raising ZeroDivisionError."""
     omega = keplerian_omega(mass, r)
     b_z = -p_phi * n_z / p_t
     denom = 1.0 - omega * b_z
-    return math.sqrt(1.0 - 3.0 * mass / r) / (denom * math.sqrt(1.0 - 2.0 * mass / r_obs))
+    num = math.sqrt(1.0 - 3.0 * mass / r)
+    den = denom * math.sqrt(1.0 - 2.0 * mass / r_obs)
+    if den == 0.0:
+        # Python raises on a division by zero; return what IEEE (and the Rust build)
+        # gives instead, a non-finite g that the caller reports as a numerical error.
+        if num == 0.0 or math.isnan(num):
+            return math.nan
+        return math.copysign(math.inf, num) * math.copysign(1.0, den)
+    return num / den
 
 
 def hit_position_lab(r, phi, beta):
@@ -221,8 +236,9 @@ def blackbody_chromaticity(t):
 
 def tonemap(relative_intensity):
     """Maps a bolometric intensity relative to the disk's peak ((gT/T_peak)^4, which
-    exceeds 1 on the approaching side) to a display luminance in [0, 1)."""
-    return 1.0 - math.exp(-2.0 * relative_intensity)
+    exceeds 1 on the approaching side) to a display luminance in [0, 1] (1 only once
+    the exponential underflows)."""
+    return 1.0 - math.exp(-relative_intensity)
 
 
 def _round_half_away_from_zero(x):
@@ -246,18 +262,43 @@ def srgb_encode(v):
     return min(max(_round_half_away_from_zero(s * 255.0), 0), 255)
 
 
-def disk_pixel(g, t_emit, t_peak):
-    """The (R, G, B) pixel, ints in 0..255, for a hit seen with redshift factor g on
-    material at effective temperature t_emit, relative to the disk's peak
-    temperature."""
+# Rec. 709 / sRGB luminance weights of linear R, G, B (they sum to 1).
+LUMINANCE_WEIGHTS = (0.2126, 0.7152, 0.0722)
+
+
+def luminance(c):
+    """Linear luminance Y of a linear-sRGB colour."""
+    return LUMINANCE_WEIGHTS[0] * c[0] + LUMINANCE_WEIGHTS[1] * c[1] + LUMINANCE_WEIGHTS[2] * c[2]
+
+
+def disk_rgb_linear(g, t_emit, t_peak):
+    """Linear-sRGB colour (r, g, b) of a hit seen with redshift factor g on material at
+    effective temperature t_emit: luminance exactly tonemap((gT/T_peak)^4), hue the
+    blackbody chromaticity at gT. Where that hue cannot reach the luminance without a
+    channel above 1, the colour is mixed with grey of the same luminance just enough
+    to fit, so the luminance is kept and the hue desaturates towards white. Black when
+    gT is not a number or below MIN_DRAWN_TEMPERATURE."""
     t_obs = g * t_emit
     if math.isnan(t_obs) or t_obs < MIN_DRAWN_TEMPERATURE:
-        return (0, 0, 0)
+        return (0.0, 0.0, 0.0)
     x = t_obs / t_peak
     x2 = x * x
     l = tonemap(x2 * x2)
     c = blackbody_chromaticity(t_obs)
-    return (srgb_encode(l * c[0]), srgb_encode(l * c[1]), srgb_encode(l * c[2]))
+    k = l / luminance(c)
+    rgb = (k * c[0], k * c[1], k * c[2])
+    m = max(max(rgb[0], rgb[1]), rgb[2])
+    if m <= 1.0:
+        return rgb
+    # m > 1 >= l, so the mixing weight lies in [0, 1).
+    s = (1.0 - l) / (m - l)
+    return (l + s * (rgb[0] - l), l + s * (rgb[1] - l), l + s * (rgb[2] - l))
+
+
+def disk_pixel(g, t_emit, t_peak):
+    """The 8-bit (R, G, B) pixel, ints in 0..255, of disk_rgb_linear."""
+    c = disk_rgb_linear(g, t_emit, t_peak)
+    return (srgb_encode(c[0]), srgb_encode(c[1]), srgb_encode(c[2]))
 
 
 def crossing_check(phi_d, r_in, r_out, r_prev, phi_prev, r, phi):
@@ -267,9 +308,15 @@ def crossing_check(phi_d, r_in, r_out, r_prev, phi_prev, r, phi):
     crossing radius is interpolated linearly in phi. Returns None, or
     (r_hit, phi_c, in_band) with phi_c = phi_d + k*pi the crossing azimuth and
     in_band whether r_in <= r_hit <= r_out. phi must not be wrapped between calls.
+    Non-finite inputs (a NaN phi_d marks a ray in the disk plane) give None, as in
+    the kernels and the Rust build.
     """
-    k_prev = math.floor((phi_prev - phi_d) / PI)
-    k = math.floor((phi - phi_d) / PI)
+    a_prev = (phi_prev - phi_d) / PI
+    a_now = (phi - phi_d) / PI
+    if not (math.isfinite(a_prev) and math.isfinite(a_now)):
+        return None
+    k_prev = math.floor(a_prev)
+    k = math.floor(a_now)
     d = k - k_prev
     if d != 1 and d != -1:
         return None

@@ -66,20 +66,34 @@ build's `disk.rs` with the same operation order).
 angle between `n` and the observer's position vector `+x̂`: 0 face-on, 90 edge-on, 180
 face-on from the other side, which reverses the sense of rotation on the sky.
 `--disk-azimuth` (default 0°) turns `n` right-handedly about `+x̂`:
-`n = R_x(azimuth) · (cos i, 0, sin i)`. At azimuth 0 an inclined disk's near side is
-below the black hole and its far side above. Both angles are measured against the
-observer's position, not the optical axis, so turning the camera does not move the
-disk. The material orbits right-handedly about `n` (at `x` it moves along `n × x̂`):
+`n = R_x(azimuth) · (cos i, 0, sin i)`. At azimuth 0 a disk inclined by less than 90°
+has its near side below the black hole and its far side above; between 90° and 180°
+(the same plane as `(180° − i, azimuth + 180°)`, turning the other way) the near side
+is above. Both angles are measured against the observer's position, not the optical
+axis, so turning the camera does not move the disk. The material orbits right-handedly about `n` (at `x` it moves along `n × x̂`):
 edge-on with `n = +ẑ`, the left side of the disk approaches the observer and is
 blueshifted. `--disk-inner` defaults to the ISCO, `6M`, and may not be smaller;
-`--disk-outer` (default `20M`) must stay below `--observer-distance`.
+`--disk-outer` (default `20M`) must lie more than one step inside the observer,
+below `--observer-distance − --delta` (see Crossings), so with `--bh-mass` 1.5 or more
+and the default `--observer-distance 30` pass `--disk-outer` or a larger
+`--observer-distance`. An invalid disk is reported with the radii actually used and
+which of them were defaults. The disk flags only take effect with `--disk`.
 
 **Crossings.** Each ray carries the azimuth `phi_d` at which the disk plane cuts its
 orbital plane (`Disk.ray_frame`). The integrator kernel checks after every step, from
 the second step on, whether `floor((φ − phi_d)/π)` changed by exactly one, interpolates
 the crossing radius linearly in `φ`, counts the crossing, and ends the ray (status 4,
-collision `disk`) when the radius lies in `[r_in, r_out]`. `φ` is never wrapped. With
-the disk off the kernel reproduces the previous results bit for bit.
+collision `disk`) when the radius lies in `[r_in, r_out]`. `φ` is never wrapped. The
+first step is skipped because every ray starts at the observer, which sits on the
+crossing line of an edge-on disk, where rounding could register a crossing at `r_obs`.
+A null ray moves at most `|dr/dλ| ≤ p_t < 1` per unit affine parameter, so a crossing
+during the first step lies within `δ` of `r_obs`; skipping it is harmless only while
+`r_out < r_obs − δ`, which `main.py` and `run_manual_simulation` enforce (`r_out < r_obs`
+alone is not enough). The kernel stops a ray with the Rust build's exit test, checked
+before every step: diverged (status 3: `r` of the first copy not finite or `≤ 0`, or
+the second FANTASY copy not finite or inside the horizon, `r₂ ≤ r_s`), then captured
+(`r ≤ 1.1 r_s`), then escaped (`r ≥ r_max`). With the disk off it reproduces the
+previous kernel bit for bit on every ray that does not diverge.
 
 **Redshift.** With `p_t`, `p_φ` the ray's conserved initial momenta in its rotated
 frame, `n'_z` the component of the disk normal along the ray's angular momentum,
@@ -94,18 +108,39 @@ and positive is physically impossible and is reported as a `numerical error` (re
 
 **Emission and colour.** The effective temperature follows the Shakura–Sunyaev profile
 `T⁴ ∝ (1 − √(r_in/r)) / r³`, which peaks at `r = 49/36 r_in`; the peak value is
-`--disk-temperature` (default 6000 K). The observed spectrum is a blackbody at `gT`:
-the pixel is the chromaticity of a blackbody at `gT` (Kang et al. 2002 fit of the
-Planckian locus → linear sRGB, largest channel 1) scaled by the tone-mapped intensity
-`1 − exp(−2 (gT/T_peak)⁴)`, then sRGB-encoded. The temperature is a **false-colour**
+`--disk-temperature` (default 6000 K). The observed spectrum is a blackbody at `gT`
+(nothing is multiplied by `g⁴` on top of that), so the pixel depends on `g` and `T`
+only through `gT`. Its linear luminance (Rec. 709 weights) is exactly
+`1 − exp(−(gT/T_peak)⁴)`: 0.63 at the peak temperature without Doppler shift, leaving
+headroom for the approaching side, and rising monotonically with `g`. Its hue is the
+chromaticity of a blackbody at `gT` (Kang et al. 2002 fit of the Planckian locus →
+linear sRGB); a colour too saturated to reach that luminance with every channel at
+most 1 is desaturated toward white at constant luminance (`disk_rgb_linear`). The
+result is sRGB-encoded (`disk_pixel`). The temperature is a **false-colour**
 parameter: it sets the hue, not the physics; at realistic disk temperatures every
 pixel would be white. The no-gravity image draws the disk with `g = 1`.
 
 **Output.** `photon_data.csv` keeps its previous columns and gains, in this order,
 `disk_r`, `disk_phi` (hit radius and azimuth in the ray's rotated frame), `disk_x`,
 `disk_y`, `disk_z` (lab-frame hit position), `disk_g`, `disk_temp` (kelvin), all NaN
-unless the ray ended on the disk, and `plane_crossings`, which counts every crossing of
-the disk plane, the hit included (0 without a disk). The summaries report `Hit disk`.
+unless the ray ended on the disk (written as the literal `nan`, as in the Rust build),
+and `plane_crossings`, which counts every crossing of the disk plane, the hit included
+(0 without a disk). The summaries report `Hit disk`.
+
+**Notes (behaviour shared with the Rust build).**
+
+- A ray the integrator stops as diverged (status 3) is a `numerical error` (red), with
+  or without a disk. Before the disk port the kernel only tested capture and escape, so
+  such a ray kept stepping and was classified by its final radius; at `--delta 0.01`
+  this almost never happens, at larger steps near-critical rays can diverge.
+- The saved PNGs (`images/manual_output.png`, `images/no_gravity.png`) now have up at
+  the top: row `i = 0` of the pixel grid is the bottom row of the image, as in the
+  `origin='lower'` preview. Earlier PNGs were stored upside down, so the direction
+  statements above (pitch, roll, near side of the disk) hold for the new files only.
+- The scene plots draw the image plane of the pointed camera (`--yaw`, `--pitch`,
+  `--roll`).
+- Sampled trajectories are thinned over the recorded states only and always end on
+  the exit state (or, for a disk hit, the state just past the disk).
 
 ```
 NUMBA_ENABLE_CUDASIM=1 python main.py --size 100 --steps 20000 --disk --disk-inclination 75 --yaw 6 --pitch -4

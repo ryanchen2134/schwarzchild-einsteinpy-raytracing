@@ -606,14 +606,24 @@ def fantasy_integrate_batch_ord2_full(q0s, p0s, steps, delta, rs, r_max, omega, 
 # of exactly one in floor((phi - disk_phi)/pi); the crossing radius is interpolated
 # linearly in phi, counted, and ends the ray when it lies in [disk_r_in, disk_r_out].
 # phi is never reduced modulo 2*pi, so the floor is monotone along the ray. Each
-# step's crossing check runs before the next step's capture/escape check, so a
-# crossing on a ray's last step is not lost. With every disk_phi NaN the loop is the
-# one of fantasy_integrate_batch_ord2 and the results are bit-identical.
+# step's crossing check runs before the next step's exit test, so a crossing on a
+# ray's last step is not lost. No crossing is looked for during the first step: every
+# ray starts at the observer, which sits on the crossing line of an edge-on disk, and
+# a crossing during the first step lies within delta of r_obs (|dr/dlambda| <= p_t < 1),
+# so skipping it is only safe while r_out < r_obs - delta, which run_manual_simulation
+# and main.py enforce.
+#
+# The exit test is the Rust build's (integrator.rs Run::exit_reason, fantasy.cu
+# exit_reason), before every step and once more when the budget runs out: a ray whose
+# first copy has a non-finite or non-positive r, or whose second copy has a
+# non-finite r or one inside the horizon (r2 <= rs), stops as diverged; then capture
+# (r1 <= 1.1 rs), then escape (r1 >= r_max). On every ray that does not diverge the
+# loop is the one of fantasy_integrate_batch_ord2 (which tests capture and escape
+# only), so with every disk_phi NaN the results are bit-identical to it.
 #
 # Exit status codes (out_status): 0 step budget exhausted inside the domain,
-# 1 captured (r <= 1.1 rs), 2 escaped (r >= r_max), 4 hit the accretion disk.
-# (3, "diverged", is reserved for parity with the Rust build; these kernels keep the
-# old kernels' exit test, which does not detect a non-finite state.)
+# 1 captured (r <= 1.1 rs), 2 escaped (r >= r_max), 3 diverged (numerical error),
+# 4 hit the accretion disk.
 
 _PI = 3.141592653589793  # the same double as math.pi
 
@@ -648,7 +658,10 @@ def fantasy_integrate_batch_ord2_disk(q0s, p0s, steps, delta, rs, r_max, omega,
     n_cross = 0
     st = 0
     for step in range(steps):
-        # early exit if outside domain (checked before the step, as the old kernel does)
+        # exit test before the step, in the Rust build's order (see above)
+        if not math.isfinite(q1[1]) or q1[1] <= 0.0 or not math.isfinite(q2[1]) or q2[1] <= rs:
+            st = 3
+            break
         if q1[1] <= 1.1 * rs:
             st = 1
             break
@@ -681,8 +694,11 @@ def fantasy_integrate_batch_ord2_disk(q0s, p0s, steps, delta, rs, r_max, omega,
                         st = 4
                         break
     if st == 0:
-        # Budget exhausted: a boundary crossed on the last permitted step still counts.
-        if q1[1] <= 1.1 * rs:
+        # Budget exhausted: a boundary crossed (or a divergence reached) on the last
+        # permitted step still counts.
+        if not math.isfinite(q1[1]) or q1[1] <= 0.0 or not math.isfinite(q2[1]) or q2[1] <= rs:
+            st = 3
+        elif q1[1] <= 1.1 * rs:
             st = 1
         elif q1[1] >= r_max:
             st = 2
@@ -695,10 +711,12 @@ def fantasy_integrate_batch_ord2_disk(q0s, p0s, steps, delta, rs, r_max, omega,
 @cuda.jit
 def fantasy_integrate_batch_ord2_disk_full(q0s, p0s, steps, delta, rs, r_max, omega,
                                            disk_phi, disk_r_in, disk_r_out, out_qs_traj):
-    """fantasy_integrate_batch_ord2_full plus disk-crossing detection: records q1
-    before each step as the old kernel does; a ray that hits the disk stops there and
-    the post-crossing state is written as the next row (when it fits in the `steps`
-    rows). Rows after the last recorded state stay as the caller left them."""
+    """fantasy_integrate_batch_ord2_full plus disk-crossing detection and the Rust
+    exit test: records q1 before each step as the old kernel does and stops at the
+    first exit (diverged, captured, escaped; the exit state is the last row). A ray
+    that hits the disk stops there and the post-crossing state is written as the next
+    row, so out_qs_traj needs steps + 1 rows (a hit on the last permitted step writes
+    row `steps`). Rows after the last recorded state stay as the caller left them."""
     i = cuda.grid(1)
     n = q0s.shape[0]
     if i >= n:
@@ -717,7 +735,9 @@ def fantasy_integrate_batch_ord2_disk_full(q0s, p0s, steps, delta, rs, r_max, om
     for step in range(steps):
         for a in range(4):
             out_qs_traj[i, step, a] = q1[a]
-        # stop storing if out of domain
+        # stop storing at the first exit (the Rust build's exit test, see above)
+        if not math.isfinite(q1[1]) or q1[1] <= 0.0 or not math.isfinite(q2[1]) or q2[1] <= rs:
+            break
         if q1[1] <= 1.1 * rs or q1[1] >= r_max:
             break
         r_prev = q1[1]
@@ -739,9 +759,8 @@ def fantasy_integrate_batch_ord2_disk_full(q0s, p0s, steps, delta, rs, r_max, om
                     frac = (phi_c - ph_prev) / (q1[3] - ph_prev)
                     r_hit = r_prev + (q1[1] - r_prev) * frac
                     if r_hit >= disk_r_in and r_hit <= disk_r_out:
-                        if step + 1 < steps:
-                            for a in range(4):
-                                out_qs_traj[i, step + 1, a] = q1[a]
+                        for a in range(4):
+                            out_qs_traj[i, step + 1, a] = q1[a]
                         break
 
 # ------------------------- Wrapper class overwrite ---------------------------
@@ -753,7 +772,7 @@ _RS_UNIT = 2.0
 STATUS_STEP_LIMIT = 0
 STATUS_CAPTURED = 1
 STATUS_ESCAPED = 2
-STATUS_DIVERGED = 3  # reserved; not produced by these kernels
+STATUS_DIVERGED = 3  # numerical error: non-finite state or second copy inside the horizon
 STATUS_DISK = 4
 
 
@@ -777,8 +796,10 @@ class CUDASchwarzschildIntegrator:
     `disk_r_out` in the caller's length unit. Detection is only enabled when all three
     are given. The kernels always run with the disk arguments (an all-NaN `disk_phi`
     when there is no disk), which leaves the disk-off results bit-identical to the
-    old kernels. Status codes: 0 step limit, 1 captured, 2 escaped, 4 hit the disk
-    (STATUS_* above).
+    old kernels on every ray that does not diverge. Status codes: 0 step limit,
+    1 captured, 2 escaped, 3 diverged, 4 hit the disk (STATUS_* above). The disk band
+    must end more than one step inside the observer (r_out < r_obs - delta): crossings
+    during the first step are not checked.
     """
 
     def __init__(self, steps=500, delta=0.2, mass=1.0, omega=1.0, r_max=1e6):
@@ -832,13 +853,15 @@ class CUDASchwarzschildIntegrator:
         return out_qs, status, hits, crossings
 
     def integrate_batch_full(self, q0s, p0s, disk_phi=None, disk_r_in=None, disk_r_out=None):
-        """The (N, steps, 4) trajectory of (t, r, theta, phi) before each step, as the
-        kernel records it; rows after a ray's exit are zero. A ray that hits the disk
-        ends with the post-crossing state."""
+        """The (N, steps + 1, 4) trajectory of (t, r, theta, phi) before each step, as
+        the kernel records it; rows after a ray's last recorded state are zero. A ray
+        that leaves the domain ends with its exit state, and a ray that hits the disk
+        with the post-crossing state (row `steps` when the hit is on the last
+        permitted step, which is why there is one row more than steps)."""
         q, p = self._to_units_of_m(q0s, p0s)
         n = q.shape[0]
         phi_d, r_in, r_out = self._disk_args(n, disk_phi, disk_r_in, disk_r_out)
-        out_qs_traj = np.zeros((n, self.steps, 4), dtype=np.float64)
+        out_qs_traj = np.zeros((n, self.steps + 1, 4), dtype=np.float64)
         threads = 32
         blocks = (n + threads - 1) // threads
         fantasy_integrate_batch_ord2_disk_full[blocks, threads](

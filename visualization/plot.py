@@ -7,7 +7,24 @@ from astropy import units as u
 from mpl_toolkits.mplot3d import Axes3D
 import random
 from simulation.cuda_geodesic import CUDASchwarzschildIntegrator
-from simulation.utils import get_initial_conditions
+from simulation.utils import get_initial_conditions, camera_basis, image_plane
+
+
+def _camera_frame(camera):
+    """(optical_axis, right, up) as float arrays: the given camera basis (as returned
+    by simulation.utils.camera_basis(yaw, pitch, roll)) or the unrotated one."""
+    if camera is None:
+        camera = camera_basis()
+    return tuple(np.asarray(v, dtype=np.float64) for v in camera)
+
+
+def _image_plane_outline(obs_pos, fov, h, w, camera):
+    """The closed outline (5, 3) of the image plane of the pointed camera, built as the
+    renderers build it (simulation.utils.image_plane)."""
+    optical_axis, right, up_vec = _camera_frame(camera)
+    plane_center, width, height = image_plane(obs_pos, fov, h, w, optical_axis)
+    return np.array([plane_center + dx * width * right + dy * height * up_vec
+                     for dx, dy in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5)]])
 
 def plot_placeholder():
     """Placeholder for future plotting utilities."""
@@ -15,7 +32,8 @@ def plot_placeholder():
 
 def plot_scene_topdown(
     bh, observer, image_plane_size, boundary_radius, out_path='images/scene_topdown.png', fov_deg=50,
-    patch_center_theta=np.pi/2, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10), photon_trajectories=None
+    patch_center_theta=np.pi/2, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10), photon_trajectories=None,
+    camera=None
 ):
     """
     Plot a top-down (x-y) view of the simulation setup, matching the actual raytracing geometry:
@@ -26,6 +44,10 @@ def plot_scene_topdown(
     - Image plane as an arc at fixed radius from observer, with tick marks for each pixel
     - Background patch as an arc/segment on the boundary, centered on the point directly opposite the observer (along the optical axis)
     - Overlay photon emission directions as rays
+
+    `camera` is the (optical_axis, right, up) basis of the pointed camera
+    (simulation.utils.camera_basis); the FOV cone and image-plane arc are centred on
+    the optical axis's direction in the x-y plane. None means the unrotated camera.
     """
     fig, ax = plt.subplots(figsize=(8, 8))
     # Black hole
@@ -40,8 +62,9 @@ def plot_scene_topdown(
     # FOV cone
     fov = observer.fov
     n_pix = image_plane_size[0]
-    # Assume observer is on x axis, looking toward origin
-    obs_angle = np.arctan2(-obs_y, -obs_x)  # direction toward BH
+    # Centred on the optical axis (towards the black hole for the unrotated camera)
+    optical_axis = _camera_frame(camera)[0]
+    obs_angle = np.arctan2(optical_axis[1], optical_axis[0])
     theta0 = obs_angle - fov/2
     theta1 = obs_angle + fov/2
     # Draw FOV lines
@@ -104,7 +127,7 @@ def plot_scene_topdown(
 def plot_scene_embedding_3d(
     bh, observer, image_plane_size, boundary_radius, out_path='images/scene_topdown.png', fov_deg=None, photon_trajectories=None,
     patch_center_theta=None, patch_center_phi=None, patch_size_theta=np.deg2rad(10), patch_size_phi=np.deg2rad(10),
-    override_patch_center=False, flat_trajectories=None
+    override_patch_center=False, flat_trajectories=None, camera=None
 ):
     """
     Plot a 3D view of the Schwarzschild spatial hypersurface embedding with simulation elements to scale:
@@ -116,6 +139,8 @@ def plot_scene_embedding_3d(
     - Optionally: flat_trajectories (list of arrays of shape (N,3)), plotted in blue
     - Background patch as a magenta patch/arc/segment on the boundary sphere
     - By default, the patch center is set to the point on the boundary directly opposite the observer (unless override_patch_center=True).
+    - `camera`: the (optical_axis, right, up) basis of the pointed camera
+      (simulation.utils.camera_basis); the image plane follows it. None means unrotated.
     """
     # 1. Determine the field-of-view for constructing the image plane
     if fov_deg is None:
@@ -137,28 +162,9 @@ def plot_scene_embedding_3d(
     obs_pos = observer.position if hasattr(observer, 'position') else np.array([8*rs, 0, 0])
     ax.scatter([obs_pos[0]], [obs_pos[1]], [obs_pos[2]], color='red', s=100, label='Observer')
 
-    # 4. Add image plane (rectangle) using the resolved fov (radians)
-    obs_r = np.linalg.norm(obs_pos)
-    plane_dist = 0.2 * obs_r
-    plane_center = obs_pos - (obs_pos/obs_r) * plane_dist
-    up = np.array([0, 0, 1])
-    if np.allclose(np.cross(obs_pos, up), 0):
-        up = np.array([0, 1, 0])
-    right = np.cross(up, obs_pos)
-    right = right / np.linalg.norm(right)
-    up_vec = np.cross(obs_pos, right)
-    up_vec = up_vec / np.linalg.norm(up_vec)
-    width = 2 * plane_dist * np.tan(fov/2)
-    height = width * (image_plane_size[0]/image_plane_size[1])
-    for dx, dy in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5)]:
-        corner = plane_center + dx*width*right + dy*height*up_vec
-        if dx == -0.5 and dy == -0.5:
-            xs, ys, zs = [corner[0]], [corner[1]], [corner[2]]
-        else:
-            xs.append(corner[0])
-            ys.append(corner[1])
-            zs.append(corner[2])
-    ax.plot(xs, ys, zs, color='blue', lw=2, label='Image Plane')
+    # 4. Add image plane (rectangle) of the pointed camera, using the resolved fov (radians)
+    corners = _image_plane_outline(obs_pos, fov, image_plane_size[0], image_plane_size[1], camera)
+    ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], color='blue', lw=2, label='Image Plane')
 
     
     # 5. Add simulation boundary (sphere)
@@ -244,13 +250,17 @@ def plot_scene_embedding_3d(
         print(f"Saved 3D embedding scene image to {out_path_rot}")
     plt.close(fig) 
 
-def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene_closeup_3d.png', fov_deg=None, photon_trajectories=None):
+def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene_closeup_3d.png', fov_deg=None, photon_trajectories=None,
+                          camera=None):
     """
     Plot a close-up 3D view near the observer, showing:
     - Observer (point)
     - Image plane (rectangle)
     - Black hole event horizon (sphere)
     - FOV arc (dashed) on the image plane
+
+    `camera` is the (optical_axis, right, up) basis of the pointed camera
+    (simulation.utils.camera_basis); the image plane follows it. None means unrotated.
     """
     rs = 2 * bh.mass
     obs_pos = np.array(observer.position)
@@ -260,24 +270,8 @@ def plot_scene_closeup_3d(bh, observer, image_plane_size, out_path='images/scene
     else:
         fov = np.deg2rad(fov_deg)
     h, w = image_plane_size
-    plane_dist = 0.2 * obs_r
-    plane_center = obs_pos - (obs_pos/obs_r) * plane_dist
-    up = np.array([0, 0, 1])
-    if np.allclose(np.cross(obs_pos, up), 0):
-        up = np.array([0, 1, 0])
-    right = np.cross(up, obs_pos)
-    right = right / np.linalg.norm(right)
-    up_vec = np.cross(obs_pos, right)
-    up_vec = up_vec / np.linalg.norm(up_vec)
-    width = 2 * plane_dist * np.tan(fov/2)
-    height = width * (h/w)
-    
-    # Rectangle corners
-    corners = []
-    for dx, dy in [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5)]:
-        corner = plane_center + dx*width*right + dy*height*up_vec
-        corners.append(corner)
-    corners = np.array(corners)
+    # Rectangle corners of the pointed camera's image plane
+    corners = _image_plane_outline(obs_pos, fov, h, w, camera)
     # Event horizon # R = 2M for M=1
     u_sphere, v_sphere = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
     x_s = rs * np.cos(u_sphere) * np.sin(v_sphere)

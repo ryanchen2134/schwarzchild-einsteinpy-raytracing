@@ -12,11 +12,16 @@ Scene: 16x16 image, fov 80 deg, observer (30, 0, 0), boundary radius 31, M = 1,
 r_in 6, r_out 20, peak temperature 6000 K, camera yaw 6 deg, pitch -4 deg, roll 0.
 
 Per pixel (row i from the bottom, column j, row-major index i*16 + j) the record
-holds: i, j, status (0 step limit, 1 captured, 2 escaped, 4 disk), r_hit and phi_hit
-(the interpolated crossing in the ray's rotated frame; null when the ray did not end
-on the disk), g (the redshift factor from the conserved initial p_t, p_phi; null when
-no hit), plane_crossings, p0 (p_t, p_r, p_theta, p_phi), beta, phi_d, n_z (the disk
-in the ray's frame) and the final q (t, r, theta, phi) of the first FANTASY copy.
+holds: i, j, status (0 step limit, 1 captured, 2 escaped, 4 disk; 3, diverged, does
+not occur in this scene and is not listed in status_codes), r_hit and phi_hit (the
+interpolated crossing in the ray's rotated frame; null when the ray did not end on
+the disk), g (the redshift factor from the conserved initial p_t, p_phi; null when no
+hit), plane_crossings, p0 (p_t, p_r, p_theta, p_phi), beta, phi_d, n_z (the disk in
+the ray's frame), the final q (t, r, theta, phi) of the first FANTASY copy, and three
+fields the Rust build does not read but tests/test_disk.py checks: alpha0 (the
+angle between the ray and the -x axis, from get_initial_conditions), hit_xyz (the
+lab-frame hit position hit_position_lab(r_hit, phi_hit, beta); [null, null, null]
+when no hit) and disk_temp (Disk.temperature(r_hit) in kelvin; null when no hit).
 
 NaN is written as JSON null (standard JSON has no NaN token); the pytest that reloads
 the fixture maps null back to NaN.

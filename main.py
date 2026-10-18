@@ -6,7 +6,7 @@ from simulation.blackhole import BlackHole, Observer
 from simulation.background import save_no_gravity_image_with_background
 from simulation.raytracing import run_manual_simulation
 from visualization.plot import plot_scene_topdown, plot_scene_embedding_3d, plot_scene_closeup_3d
-from simulation.utils import _apply_relative_offsets
+from simulation.utils import _apply_relative_offsets, camera_basis
 from simulation.disk import Disk
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,7 +22,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(mes
 
 def build_disk(args, mass_bh, observer_x):
     """The simulation.disk.Disk the flags describe, or None without --disk. Invalid
-    values end the run with a message naming the flag."""
+    values end the run with a message naming the flag and the radii actually used.
+
+    The kernels do not look for a crossing during the first step, which is only safe
+    when the disk ends more than one step inside the observer, so --disk-outer (or its
+    20M default) must be below --observer-distance - --delta."""
     if not args.disk:
         return None
     if not (np.isfinite(args.disk_inclination) and 0.0 <= args.disk_inclination <= 180.0):
@@ -32,16 +36,24 @@ def build_disk(args, mass_bh, observer_x):
     normal = Disk.normal_from_angles(np.radians(args.disk_inclination), np.radians(args.disk_azimuth))
     r_in = args.disk_inner if args.disk_inner is not None else 6.0 * mass_bh
     r_out = args.disk_outer if args.disk_outer is not None else 20.0 * mass_bh
+    used = (f"--disk: inner radius {r_in}{' (default 6M)' if args.disk_inner is None else ''}, "
+            f"outer radius {r_out}{' (default 20M)' if args.disk_outer is None else ''}")
+    hint = "pass a smaller --disk-outer or a larger --observer-distance"
+    outer_too_far = not r_out < observer_x - args.delta
     try:
-        return Disk(normal, r_in, r_out, args.disk_temperature, mass_bh, observer_x)
+        disk = Disk(normal, r_in, r_out, args.disk_temperature, mass_bh, observer_x)
     except ValueError as e:
-        raise SystemExit(f"--disk-inner / --disk-outer / --disk-temperature: {e}")
+        raise SystemExit(f"{used}: {e}" + (f"; {hint}" if outer_too_far else ""))
+    if outer_too_far:
+        raise SystemExit(
+            f"{used}: --disk-outer must lie more than one step (--delta {args.delta}) inside "
+            f"--observer-distance ({observer_x}); {hint}")
+    return disk
 
 
-def main():
-    args = parse_args()
-    image_size = (args.size, args.size)
-    fov_rad = np.radians(args.fov)
+def validate_args(args):
+    """Check the flags; returns (yaw, pitch, roll) in radians and the Disk (or None).
+    Invalid values end the run (SystemExit) with a message naming the flag."""
     mass_bh = args.bh_mass
     boundary_radius = args.boundary_radius
     observer_x = args.observer_distance
@@ -53,11 +65,26 @@ def main():
         raise SystemExit(f"--boundary-radius ({boundary_radius}) must exceed --observer-distance ({observer_x})")
     if not boundary_radius < 100.0 * mass_bh:
         raise SystemExit(f"--boundary-radius ({boundary_radius}) must stay below the numerical-error radius 100 M = {100.0 * mass_bh}")
+    if not (np.isfinite(args.delta) and args.delta > 0.0):
+        raise SystemExit(f"--delta must be a positive finite number, got {args.delta}")
     for name, v in (('--yaw', args.yaw), ('--pitch', args.pitch), ('--roll', args.roll)):
         if not np.isfinite(v):
             raise SystemExit(f"{name} must be a finite angle in degrees, got {v}")
     yaw_rad, pitch_rad, roll_rad = np.radians(args.yaw), np.radians(args.pitch), np.radians(args.roll)
     disk = build_disk(args, mass_bh, observer_x)
+    return (yaw_rad, pitch_rad, roll_rad), disk
+
+
+def main():
+    args = parse_args()
+    image_size = (args.size, args.size)
+    fov_rad = np.radians(args.fov)
+    mass_bh = args.bh_mass
+    boundary_radius = args.boundary_radius
+    observer_x = args.observer_distance
+    (yaw_rad, pitch_rad, roll_rad), disk = validate_args(args)
+    # The pointed camera, for the scene plots (the renderers build the same basis).
+    camera = camera_basis(yaw_rad, pitch_rad, roll_rad)
     bh = BlackHole(mass=mass_bh)
     observer_pos = np.array([observer_x, 0, 0])
     observer = Observer(position=observer_pos, fov=fov_rad, image_size=image_size)
@@ -128,7 +155,8 @@ def main():
     plt.title('Black Hole Ray Tracing (Manual)')
     # plt.axis('off')
     plt.show()
-    plt.imsave('images/manual_output.png', img)
+    # Row i = 0 is the bottom of the image (as previewed with origin='lower' above).
+    plt.imsave('images/manual_output.png', img, origin='lower')
     logging.info("Saved manual_output.png")
 
     # already saved in raytracing.py
@@ -155,12 +183,14 @@ def main():
         # patch_center_phi=patch_center_phi_final_rad,
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
         patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
-        photon_trajectories=photon_trajectories
+        photon_trajectories=photon_trajectories,
+        camera=camera
     )
         
     logging.info("Saving close-up 3D scene view...")
     plot_scene_closeup_3d(
-        bh, observer, image_size, out_path='images/scene_closeup_3d.png', fov_deg=args.fov, photon_trajectories=photon_trajectories
+        bh, observer, image_size, out_path='images/scene_closeup_3d.png', fov_deg=args.fov, photon_trajectories=photon_trajectories,
+        camera=camera
     )
     plot_scene_embedding_3d(
         bh, observer, image_size, boundary_radius=boundary_radius,
@@ -171,7 +201,8 @@ def main():
         patch_center_phi=patch_center_phi_final_rad,
         patch_size_theta=np.deg2rad(args.bg_patch_size_theta),
         patch_size_phi=np.deg2rad(args.bg_patch_size_phi),
-        override_patch_center=False
+        override_patch_center=False,
+        camera=camera
     )
 
     # --- Print photon summary from photon_data.csv ---

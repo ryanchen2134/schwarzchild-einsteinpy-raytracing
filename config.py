@@ -1,7 +1,8 @@
 #config.py
 import argparse
 
-def parse_args():
+def parse_args(argv=None):
+    """Parse the command line (sys.argv[1:] when argv is None)."""
     parser = argparse.ArgumentParser(description="Black Hole Ray Tracing Simulation")
     parser.add_argument('--size', type=int, default=200, help='Image size (NxN) (default: 200)')
     parser.add_argument('--fov', type=float, default=80.0, help='Field of view in degrees (default: 80)')
@@ -33,9 +34,9 @@ def parse_args():
     parser.add_argument('--roll', type=float, default=0.0, help='Camera roll in degrees about the optical axis after yaw and pitch: positive turns the image counter-clockwise (default: 0)')
     # Accretion disk (README, "Accretion disk").
     parser.add_argument('--disk', action='store_true', help='Render a thin, opaque, Keplerian accretion disk')
-    parser.add_argument('--disk-inclination', type=float, default=75.0, help='Angle in degrees between the disk normal and the observer position vector +x: 0 face-on, 90 edge-on, 180 face-on with the opposite sense of rotation. Measured against the observer position, not the optical axis (default: 75)')
-    parser.add_argument('--disk-azimuth', type=float, default=0.0, help='Right-handed rotation of the disk normal about +x, in degrees. At 0 the near side of an inclined disk is below the black hole and, edge-on, the left side approaches (default: 0)')
-    parser.add_argument('--disk-inner', type=float, default=None, help='Inner radius of the disk, in the same length unit as the other radii. Defaults to the ISCO, 6M, and may not be smaller')
-    parser.add_argument('--disk-outer', type=float, default=None, help='Outer radius of the disk (default 20M); must stay below --observer-distance')
-    parser.add_argument('--disk-temperature', type=float, default=6000.0, help='Peak effective temperature of the disk in kelvin. A false-colour parameter: it sets the hue, not the physics (default: 6000)')
-    return parser.parse_args()
+    parser.add_argument('--disk-inclination', type=float, default=75.0, help='Angle in degrees between the disk normal and the observer position vector +x: 0 face-on, 90 edge-on, 180 face-on with the opposite sense of rotation. Measured against the observer position, not the optical axis (default: 75) (only with --disk)')
+    parser.add_argument('--disk-azimuth', type=float, default=0.0, help='Right-handed rotation of the disk normal about +x, in degrees. At 0 a disk inclined by less than 90 degrees has its near side below the black hole (above for 90-180) and, edge-on, the left side approaches (default: 0) (only with --disk)')
+    parser.add_argument('--disk-inner', type=float, default=None, help='Inner radius of the disk, in the same length unit as the other radii. Defaults to the ISCO, 6M, and may not be smaller (only with --disk)')
+    parser.add_argument('--disk-outer', type=float, default=None, help='Outer radius of the disk (default 20M); must lie more than one step (--delta) inside --observer-distance, so with --bh-mass 1.5 or more and the default observer distance pass it or a larger --observer-distance (only with --disk)')
+    parser.add_argument('--disk-temperature', type=float, default=6000.0, help='Peak effective temperature of the disk in kelvin. A false-colour parameter: it sets the hue, not the physics (default: 6000) (only with --disk)')
+    return parser.parse_args(argv)

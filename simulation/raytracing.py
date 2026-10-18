@@ -37,8 +37,22 @@ def run_manual_simulation(
     that cross its plane inside [r_in, r_out] end there (collision 'disk') and are
     coloured from their redshift and the local temperature; the photon table gains
     the columns disk_r, disk_phi, disk_x, disk_y, disk_z, disk_g, disk_temp and
-    plane_crossings.
+    plane_crossings. The kernels do not look for a crossing during the first step, so
+    the disk must end more than one step inside the observer
+    (disk.r_out < |observer| - delta); a ValueError says so otherwise.
+
+    A ray the integrator stops as diverged (status 3: a non-finite state, or the
+    second FANTASY copy inside the horizon) is a 'numerical error' (red), as in the
+    Rust build, whether or not there is a disk. images/manual_output.png is saved
+    with up at the top (row i = 0 of the pixel grid at the bottom).
     """
+    if disk is not None:
+        r_obs_check = float(np.linalg.norm(np.asarray(observer.position, dtype=np.float64)))
+        if not disk.r_out < r_obs_check - delta:
+            raise ValueError(
+                f"the disk's outer radius ({disk.r_out}) must lie more than one step "
+                f"(delta = {delta}) inside the observer distance ({r_obs_check}): "
+                "crossings during the first step are not checked")
     logging.info("Starting manual ray tracing simulation...")
     h, w = observer.image_size
     # Always work with RGB image so that diagnostic colours (red, blue) are visible
@@ -130,16 +144,18 @@ def run_manual_simulation(
         traj_out = cuda_integrator.integrate_batch_full(q0s_samples, p0s_samples, **sample_disk_kwargs)
         print("Integration of samples complete (CUDA)")
 
-        # ── down-sample along the integration axis ────────────────────────
-        n_steps_full = traj_out.shape[1]
-        # choose evenly-spaced indices, but never more than MAX_POINTS
-        keep_idx = np.linspace(0, n_steps_full - 1,
-                            num=min(MAX_POINTS, n_steps_full),
-                            dtype=np.int32)
-
         for sample_idx in tqdm(range(len(sample_flat_idx)),
                     desc="Converting sampled trajectories to Cartesian (CUDA)",
                     unit="ray"):
+            # ── down-sample along the integration axis ────────────────────
+            # Over the recorded rows only (up to the last non-zero one: the exit
+            # state, or the post-crossing state of a disk hit), always keeping that
+            # last row, never more than MAX_POINTS.
+            recorded = np.flatnonzero(traj_out[sample_idx].any(axis=1))
+            n_valid = int(recorded[-1]) + 1 if recorded.size else 1
+            keep_idx = np.unique(np.linspace(0, n_valid - 1,
+                                             num=min(MAX_POINTS, n_valid),
+                                             dtype=np.int64))
             traj_cart = []
             for step in keep_idx:
                 t, r, th, ph = traj_out[sample_idx, step]
@@ -221,6 +237,12 @@ def run_manual_simulation(
             else:
                 value = (255, 0, 0)
                 collision = 'numerical error'
+        elif exit_status[idx] == 3 or exit_status[idx] == 4:
+            # The integration diverged (a non-finite state, or the second copy inside
+            # the horizon), or a disk exit came without the disk geometry: a numerical
+            # error whatever the final radius, as in the Rust build.
+            value = (255, 0, 0)
+            collision = 'numerical error'
         elif not np.isfinite(r_bh) or r_bh <= 0.0:
             value = (255, 0, 0)
             collision = 'numerical error'
@@ -300,10 +322,12 @@ def run_manual_simulation(
                             'disk_g': disk_g, 'disk_temp': disk_temp,
                             'plane_crossings': int(plane_crossings[idx])})
         
-    plt.imsave('images/manual_output.png', img)
+    # Row i = 0 is the bottom of the image: save with up at the top.
+    plt.imsave('images/manual_output.png', img, origin='lower')
     logging.info("Saved manual_output.png")
     print("Saving ray photon data...")
-    pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False)
+    # NaN as the literal 'nan', as the Rust build writes it.
+    pd.DataFrame(photon_rows).to_csv('photon_data.csv', index=False, na_rep='nan')
 
     # Save sampled trajectories CSV
     if n_samples > 0 and sampled_traj_data:
@@ -327,7 +351,6 @@ def run_manual_simulation(
         n_bg = sum(1 for row in photon_rows if row['collision'] == 'escape_bg')
         n_disk = sum(1 for row in photon_rows if row['collision'] == 'disk')
         print(f"Summary: {n_captured} rays captured by BH, {n_escaped} rays escaped, {n_bg} rays hit the background image, {n_disk} rays hit the disk.")
-        print(f"  Hit disk: {n_disk}")
     else:
         print("Summary counts not available (CPU fallback mode).")
     if n_samples > 0:

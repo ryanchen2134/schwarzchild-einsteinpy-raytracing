@@ -150,7 +150,8 @@ def save_no_gravity_image_with_background(
                 else:
                     out_img[i, j] = (0, 0, 0)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    Image.fromarray(out_img).save(out_path)
+    # Row i = 0 is the bottom of the image: flip so the saved PNG has up at the top.
+    Image.fromarray(np.ascontiguousarray(out_img[::-1])).save(out_path)
     print(f"Saved no-gravity image to {out_path}")
     scene_out_path = os.path.join(os.path.dirname(out_path), 'scene_full.png')
     bg_img_full = Image.open(bg_path).convert('RGB')
